@@ -60,6 +60,18 @@ const posInt = (v: string | undefined): number | null => {
 const MAX_SEASON = 100;
 const MAX_EPISODE = 500;
 
+/**
+ * ?audio= allowlist (P2-1 2026-10-08): unknown values 400 BAD_AUDIO, never
+ * silently ignored. Absent/empty = default Hindi-first chain.
+ * Returns null AFTER sending the 400 (caller must return).
+ */
+const checkAudio = (res: any, v: string | null): string | undefined | null => {
+  if (v === null || v === "") return undefined;
+  if (v === "hi" || v === "en") return v;
+  send(res, 400, fail("invalid audio (expected hi or en)", "BAD_AUDIO"));
+  return null;
+};
+
 /** TMDB ids are numeric — reject anything else before it reaches upstream URLs. */
 const tmdbId = (v: string | undefined): string | null =>
   v && /^\d+$/.test(v) ? v : null;
@@ -263,7 +275,9 @@ export default async function handler(req: any, res: any) {
     if ((m = path.match(/^\/v1\/stream\/movie\/([^/]+)$/))) {
       const id = tmdbId(m[1]);
       if (!id) return send(res, 400, fail("invalid tmdb id", "BAD_QUERY"));
-      const data = await resolveStream(id, "movie", undefined, undefined, q.get("audio") || undefined);
+      const audio = checkAudio(res, q.get("audio"));
+      if (audio === null) return;
+      const data = await resolveStream(id, "movie", undefined, undefined, audio);
       return send(res, 200, ok(data), { "Cache-Control": "no-store" });
     }
     if ((m = path.match(/^\/v1\/stream\/tv\/([^/]+)\/([^/]+)\/([^/]+)$/))) {
@@ -274,7 +288,9 @@ export default async function handler(req: any, res: any) {
       if (season === null || episode === null || season > MAX_SEASON || episode > MAX_EPISODE) {
         return send(res, 400, fail("invalid season/episode (expected season 1-100, episode 1-500)", "BAD_QUERY"));
       }
-      const data = await resolveStream(id, "tv", season, episode, q.get("audio") || undefined);
+      const audio = checkAudio(res, q.get("audio"));
+      if (audio === null) return;
+      const data = await resolveStream(id, "tv", season, episode, audio);
       return send(res, 200, ok(data), { "Cache-Control": "no-store" });
     }
 
