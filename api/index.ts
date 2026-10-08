@@ -309,7 +309,9 @@ export default async function handler(req: any, res: any) {
         category: c.category,
         country: c.country,
         logo: c.logo,
-        reason: "awaiting-source",
+        // P1-4 (2026-10-08): youtube-type channels are never playable
+        // in-app — say so honestly instead of "awaiting-source".
+        reason: c.type === "youtube" ? "youtube-only" : "awaiting-source",
       }));
       return send(res, 200, ok({
         refreshedAt: data.refreshedAt,

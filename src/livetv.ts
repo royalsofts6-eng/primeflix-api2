@@ -975,7 +975,7 @@ export async function refreshChannels(): Promise<RefreshResult> {
     });
   }
 
-  const alive = channels.filter((c) => c.url || c.type === "youtube").length;
+  const alive = channels.filter(isPlayable).length;
   const result: RefreshResult = {
     refreshedAt: Date.now(),
     total: channels.length,
@@ -1000,18 +1000,19 @@ export async function refreshChannels(): Promise<RefreshResult> {
       }
       return ch;
     });
-    result.alive = result.channels.filter(
-      (c) => c.url || c.type === "youtube",
-    ).length;
+    result.alive = result.channels.filter(isPlayable).length;
   }
 
   cacheSet(CACHE_KEY, result, TTL_MS, STALE_MS);
   return result;
 }
 
-/** A channel is playable if it has a stream URL or is YouTube-type (resolved at play time). */
+/** A channel is playable only with a real HLS stream URL. YouTube-type
+ *  channels are NEVER playable in the app (no YouTube player path exists
+ *  in the UI) — they must not appear in `alive` (P1-4 2026-10-08: Geo
+ *  News rendered a dead card). They surface honestly in `pending`. */
 export function isPlayable(ch: Channel): boolean {
-  return ch.type === "youtube" || !!ch.url;
+  return ch.type === "hls" && !!ch.url;
 }
 
 /** Remove dead channels (no URL) so the app only shows working ones. */
