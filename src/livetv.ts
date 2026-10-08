@@ -164,7 +164,7 @@ const CURATED: Channel[] = [
     category: "in-entertainment",
     country: "in",
     type: "hls",
-    url: "",
+    url: "http://51.75.127.199:3141/starplushd/index.m3u8",
     fallbacks: [],
   },
   {
@@ -173,7 +173,7 @@ const CURATED: Channel[] = [
     category: "in-entertainment",
     country: "in",
     type: "hls",
-    url: "",
+    url: "http://51.75.127.199:3141/colorssd/index.m3u8",
     fallbacks: [],
   },
   {
@@ -182,7 +182,7 @@ const CURATED: Channel[] = [
     category: "in-entertainment",
     country: "in",
     type: "hls",
-    url: "",
+    url: "http://38.96.178.205/SONYHD/index.m3u8",
     fallbacks: [],
   },
 
@@ -193,7 +193,7 @@ const CURATED: Channel[] = [
     category: "in-movies",
     country: "in",
     type: "hls",
-    url: "",
+    url: "http://51.75.127.199:3141/stargoldselecthd/index.m3u8",
     fallbacks: [],
   },
   {
@@ -202,7 +202,7 @@ const CURATED: Channel[] = [
     category: "in-movies",
     country: "in",
     type: "hls",
-    url: "",
+    url: "http://107.167.16.138/sonymax2/index.m3u8?token=test",
     fallbacks: [],
   },
   {
@@ -220,8 +220,8 @@ const CURATED: Channel[] = [
     category: "in-movies",
     country: "in",
     type: "hls",
-    url: "",
-    fallbacks: [],
+    url: "http://51.75.127.199:3141/colorscineplexhd/index.m3u8",
+    fallbacks: ["http://51.75.127.199:3141/colorscineplexbollywood/index.m3u8"],
   },
 
   // — Sports & Cricket —
@@ -478,26 +478,40 @@ export async function refreshChannels(): Promise<RefreshResult> {
   return result;
 }
 
+/** A channel is playable if it has a stream URL or is YouTube-type (resolved at play time). */
+export function isPlayable(ch: Channel): boolean {
+  return ch.type === "youtube" || !!ch.url;
+}
+
+/** Remove dead channels (no URL) so the app only shows working ones. */
+export function hideDead(channels: Channel[]): Channel[] {
+  return channels.filter(isPlayable);
+}
+
 /**
  * Get channels — fast path serves cache, triggers background refresh on stale.
+ * Dead channels (empty URL) are auto-hidden from the response.
  */
 export async function getChannels(): Promise<RefreshResult> {
   const cached = cacheGet<RefreshResult>(CACHE_KEY);
   if (cached && !cached.stale) {
-    return cached.value;
+    const visible = hideDead(cached.value.channels);
+    return { ...cached.value, channels: visible, alive: visible.length };
   }
   if (cached && cached.stale) {
     // Serve stale immediately, refresh in background
     refreshChannels().catch(() => {});
-    return cached.value;
+    const visible = hideDead(cached.value.channels);
+    return { ...cached.value, channels: visible, alive: visible.length };
   }
   // Cold start: serve curated list immediately (fast, avoids Vercel 10s kill),
   // refresh in background so next request gets probed URLs.
+  const visible = hideDead(CURATED);
   const result: RefreshResult = {
     refreshedAt: Date.now(),
     total: CURATED.length,
-    alive: CURATED.filter((c) => c.url || c.type === "youtube").length,
-    channels: CURATED,
+    alive: visible.length,
+    channels: visible,
   };
   cacheSet(CACHE_KEY, result, TTL_MS, STALE_MS);
   refreshChannels().catch(() => {});

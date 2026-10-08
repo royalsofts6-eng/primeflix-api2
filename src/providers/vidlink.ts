@@ -39,9 +39,11 @@ function parseResponse(data: any): ProviderResult | null {
   if (qualities.length === 0) return null;
 
   const subtitles: Subtitle[] = [];
-  const subs = data?.stream?.subtitles || data?.subtitles || [];
+  // VidLink field is `stream.captions` (verified live 2026-10-08) — NOT `subtitles`.
+  // Caption objects: { id, url, language (native name e.g. "हिन्दी"), type, hasCorsRestrictions }
+  const subs = data?.stream?.captions || data?.stream?.subtitles || data?.subtitles || [];
   for (const s of subs as any[]) {
-    if (s?.url) subtitles.push({ lang: s.lang || s.label || "und", url: s.url });
+    if (s?.url) subtitles.push({ lang: s.language || s.lang || s.label || "und", url: s.url });
   }
 
   return { provider: "vidlink", qualities, subtitles };
