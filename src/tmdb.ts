@@ -47,16 +47,16 @@ async function tmdbGet(path: string, params: Record<string, string>, opts: TmdbF
 
   const p = (async (): Promise<unknown> => {
     const url = new URL(TMDB + path);
+    // NOTE (2026-10-08): the key MUST stay a ?api_key= query param. TMDB v3
+    // API keys do not work as Authorization: Bearer (that needs a v4 read
+    // access token) — Bearer was tried and returned HTTP 401 on every call.
+    // Exposure is limited to TLS-encrypted server→TMDB transit.
+    url.searchParams.set("api_key", key());
     for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
 
     try {
       const res = await fetch(url.toString(), {
-        headers: {
-          "User-Agent": "PrimeFlix/1.0",
-          // TMDB API key via Authorization header — never in the query
-          // string (keys in URLs land in proxy/upstream logs).
-          Authorization: `Bearer ${key()}`,
-        },
+        headers: { "User-Agent": "PrimeFlix/1.0" },
         signal: AbortSignal.timeout(8000),
       });
       if (res.status === 429) throw new Error("TMDB rate limited (HTTP 429)");
