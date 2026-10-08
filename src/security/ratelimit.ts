@@ -1,9 +1,10 @@
 /**
  * Token-bucket rate limiting — per member + endpoint class.
  *
- * Limits (final plan v1.0):
+ * Limits (v1.1 — 2026-10-08 429 fix):
  *   /v1/tmdb/*   : 100 req/min per member
- *   /v1/stream/* :  20 req/min per member
+ *   /v1/stream/* :  60 req/min per member (was 20 — too low; home load fires
+ *                   20-30 checkPlayable calls via /v1/stream/movie/*)
  *   /v1/auth/*   :  10 req/min per IP (brute-force protection)
  *   default      :  60 req/min per member
  *
@@ -64,8 +65,8 @@ export function checkRateLimit(pathname: string, identity: string): RateLimit {
   let capacity: number;
   let perMin: number;
   if (pathname.startsWith("/v1/stream/")) {
-    capacity = 20;
-    perMin = 20;
+    capacity = 60;
+    perMin = 60;
   } else if (pathname.startsWith("/v1/tmdb/")) {
     capacity = 100;
     perMin = 100;
