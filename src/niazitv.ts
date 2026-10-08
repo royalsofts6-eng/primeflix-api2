@@ -174,7 +174,14 @@ export async function getSeasons(serieId: string): Promise<NiaziSeason[]> {
         url: `${BASE}/drama/${id}/${m[4]}`,
       });
     }
-    if (out.length === 0) throw new Error("no seasons parsed (site structure changed?)");
+    if (out.length === 0) {
+      // The page fetched fine (HTTP 200) but carried no season cards: the
+      // series id is valid-format but unknown → 404 SERIES_NOT_FOUND, not
+      // 500 (P1-3 2026-10-08). A genuine site-structure break still
+      // surfaces at the /v1/niazi/series catalog level ("no series
+      // parsed"), so ops keep their signal there.
+      throw new Error(`series not found: ${serieId}`);
+    }
     cacheSet(cacheKey, out, NIAZI_TTL.seasons, NIAZI_TTL.staleSeasons);
     return out;
   } catch (e) {

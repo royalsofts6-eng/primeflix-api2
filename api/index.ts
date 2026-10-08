@@ -363,6 +363,11 @@ export default async function handler(req: any, res: any) {
     } else if (msg.includes("all providers")) {
       code = "UPSTREAM_ERROR";
       status = 502;
+    } else if (msg.startsWith("series not found")) {
+      // P1-3 (2026-10-08): valid-format but unknown Niazi series id is a
+      // client error, not a server error.
+      code = "SERIES_NOT_FOUND";
+      status = 404;
     } else if (/^TMDB HTTP \d+$/.test(msg)) {
       // P1-2 (2026-10-08): upstream TMDB errors are never OUR 500.
       // 4xx passes through as-is (400/404/...); 5xx becomes 502
