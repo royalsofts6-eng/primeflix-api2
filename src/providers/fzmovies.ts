@@ -151,6 +151,9 @@ function scoreHit(hit: SearchHit, title: string, year: string): number {
   if (year && hit.year === year) score += 20;
   // penalize obvious mismatches: less than half the title words matched
   if (tWords.size > 0 && overlap < tWords.size / 2) score -= 40;
+  // HARD REJECT: zero title-word overlap = definitely the wrong movie.
+  // (Prevents the [Hindi] bonus from rescuing a complete mismatch.)
+  if (tWords.size > 0 && overlap === 0) return -1000;
   return score;
 }
 
