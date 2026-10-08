@@ -1,14 +1,19 @@
 /**
- * NiaziTV scraper — Turkish dramas with Urdu subtitles. (v2 — updated 2026-10-08)
+ * NiaziTV scraper — Turkish dramas with Urdu subtitles. (v3 — fixed 2026-10-08)
  *
  * Source: https://play.niazitv.pk (server-rendered HTML, no JS needed)
  *
- * URL pattern (verified live 2026-10-08):
+ * URL pattern (verified live 2026-10-08, matches the working client-side
+ * NiaziTvClient.kt — the backend previously used stale forms):
  *   GET /all-series                          -> drama catalog (27 series)
- *   GET /all-seasons?serie={serieId}          -> SEASON list for a drama
- *   GET /drama/{seasonId}                     -> episode list for a season
- *   GET /drama/{seasonId}?watch=1&episode={episodeId}
+ *   GET /all-seasons?serie={serieId}          -> SEASON cards (/drama/{seasonId}/{slug})
+ *   GET /drama/{seasonId}/{slug}              -> EPISODE cards
+ *     (relative links: single-serie?watch=1&episode={episodeId})
+ *   GET /drama/{seasonId}/single-serie?watch=1&episode={episodeId}
  *                                            -> JSON-LD contentUrl (.m3u8)
+ *
+ * NOTE: the site-root /single-serie?... 302-redirects to /error — the watch
+ * URL must be built from the season page base (/drama/{seasonId}).
  *
  * CRITICAL (C2): contentUrl MUST be validated against the CDN allowlist.
  * Promo/trailer placeholders (e.g. video.twimg.com) are NEVER returned
@@ -178,10 +183,16 @@ export async function getSeasons(serieId: string): Promise<NiaziSeason[]> {
   }
 }
 
-// ── 3. Episode list (per season) ────────────────────────────────────────────
+// ── 3. Episode list (per season page) ───────────────────────────────────────
+// Episode cards on /drama/{seasonId}/{slug} (verified 2026-10-08 — same
+// pattern as the working client-side scraper):
+//   <img src="..." alt="Episode 1 - Urdu Subtitles">
+//   <a class="uk-position-cover" href="single-serie?watch=1&amp;episode=4079"></a>
+//   <dt ...>Episode 1 - Urdu Subtitles</dt>
 const RE_EPISODE = new RegExp(
   '<img src="([^"]+)"[^>]*alt="([^"]*)"[^>]*>.*?' +
-    'href="single-serie\\?watch=1&amp;episode=(\\d+)"',
+    'href="single-serie\\?watch=1&amp;episode=(\\d+)".*?' +
+    "<dt[^>]*>\\s*([^<]+?)\\s*</dt>",
   "gs"
 );
 
@@ -199,12 +210,15 @@ export async function getEpisodes(seasonId: string): Promise<NiaziEpisode[]> {
   if (cached && !cached.stale) return cached.value;
 
   try {
+    // /drama/{seasonId} resolves to the season page (verified live 2026-10-08:
+    // same episode cards as the slugged URL).
     const html = await fetchPage(`${BASE}/drama/${seasonId}`);
     const out: NiaziEpisode[] = [];
     const seen = new Set<string>();
     for (const m of html.matchAll(RE_EPISODE)) {
       const id = m[3];
-      const title = (m[2] || "").trim();
+      // Prefer the <dt> title text; fall back to img alt.
+      const title = (m[4] || "").trim() || (m[2] || "").trim();
       // Skip logo/nav artifacts
       if (/logo/i.test(title) && /whitelogo/i.test(m[1])) continue;
       if (seen.has(id)) continue;
@@ -223,6 +237,37 @@ export async function getEpisodes(seasonId: string): Promise<NiaziEpisode[]> {
     if (cached) return cached.value; // stale fallback
     throw e;
   }
+}
+
+/**
+ * All episodes for a SERIES (aggregates every season page).
+ * Route: GET /v1/niazi/series/:id/episodes — the old route passed the series
+ * id into the season-scoped getEpisodes() (wrong); this is the honest fix.
+ * Seasons are fetched in parallel (15s each) behind the 6h in-memory cache.
+ */
+export async function getEpisodesForSerie(serieId: string): Promise<NiaziEpisode[]> {
+  serieId = numId(serieId, "serieId");
+  const seasons = await getSeasons(serieId);
+  const perSeason = await Promise.all(
+    seasons.map(async (s, i) => {
+      try {
+        const eps = await getEpisodes(s.id);
+        const prefix = seasons.length > 1 ? `${seasonLabel(s.title, i)} • ` : "";
+        return eps.map((e) => ({ ...e, title: prefix + e.title }));
+      } catch {
+        return [] as NiaziEpisode[];
+      }
+    })
+  );
+  const out = perSeason.flat();
+  if (out.length === 0) throw new Error("no episodes parsed (site structure changed?)");
+  return out;
+}
+
+/** Season display label, e.g. "Season 2" (mirrors the client-side scraper). */
+function seasonLabel(title: string, fallbackIndex: number): string {
+  const m = title.match(/season\s*(\d+)/i);
+  return m ? `Season ${m[1]}` : `Season ${fallbackIndex + 1}`;
 }
 
 // ── 4. Stream URL ───────────────────────────────────────────────────────────
@@ -259,16 +304,22 @@ export async function getStreamUrl(seasonId: string, episodeId: string): Promise
   episodeId = numId(episodeId, "episodeId");
 
   // NOTE: stream URLs are signed/time-limited — NEVER cache.
-  const pageUrl = `${BASE}/drama/${seasonId}?watch=1&episode=${episodeId}`;
+  // Watch-URL form verified live 2026-10-08 (same as the working client-side
+  // scraper): /drama/{seasonId}/single-serie?watch=1&episode={episodeId}.
+  const seasonBase = `${BASE}/drama/${seasonId}`;
+  const pageUrl = `${seasonBase}/single-serie?watch=1&episode=${episodeId}`;
   const html = await fetchPage(pageUrl);
   const found = extractContentUrl(html);
   if (!found) throw new Error("no stream URL found on episode page");
 
   // CRITICAL C2: allowlist validation — reject promo/trailer URLs
   if (!isAllowedStreamUrl(found.url)) {
-    throw new Error(
-      `stream URL rejected by allowlist (host not a NiaziTV CDN): ${found.url.slice(0, 80)}`
-    );
+    // Log the host only, never URL fragments (may contain signed material).
+    let host = "?";
+    try {
+      host = new URL(found.url).hostname;
+    } catch { /* keep "?" */ }
+    throw new Error(`stream URL rejected by allowlist (host not a NiaziTV CDN): ${host}`);
   }
 
   return {

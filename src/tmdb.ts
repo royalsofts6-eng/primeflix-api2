@@ -32,26 +32,53 @@ async function tmdbGet(path: string, params: Record<string, string>, opts: TmdbF
   const cached = cacheGet<unknown>(opts.cacheKey);
   if (cached && !cached.stale) return cached.value;
 
-  const url = new URL(TMDB + path);
-  url.searchParams.set("api_key", key());
-  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
-
-  try {
-    const res = await fetch(url.toString(), {
-      headers: { "User-Agent": "PrimeFlix/1.0" },
-      signal: AbortSignal.timeout(8000),
-    });
-    if (res.status === 429) throw new Error("TMDB rate limited (HTTP 429)");
-    if (!res.ok) throw new Error(`TMDB HTTP ${res.status}`);
-    const data = await res.json();
-    cacheSet(opts.cacheKey, data, opts.ttlMs, opts.staleMs);
-    return data;
-  } catch (e) {
-    // Serve stale on failure (C4: never blank screen)
-    if (cached) return cached.value;
-    throw e;
+  // Single-flight: concurrent requests for the same cache key share ONE
+  // upstream fetch. TMDB is 40 req/10s per IP shared across all Vercel
+  // customers on the same egress IPs — a stampede after TTL expiry used to
+  // multiply upstream calls N× and cause the 429s surfaced as "Server busy".
+  const ongoing = inflight.get(opts.cacheKey);
+  if (ongoing) {
+    try {
+      return await ongoing;
+    } catch {
+      // The owner will serve stale-or-throw below; fall through to our own fetch.
+    }
   }
+
+  const p = (async (): Promise<unknown> => {
+    const url = new URL(TMDB + path);
+    for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+
+    try {
+      const res = await fetch(url.toString(), {
+        headers: {
+          "User-Agent": "PrimeFlix/1.0",
+          // TMDB API key via Authorization header — never in the query
+          // string (keys in URLs land in proxy/upstream logs).
+          Authorization: `Bearer ${key()}`,
+        },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (res.status === 429) throw new Error("TMDB rate limited (HTTP 429)");
+      if (!res.ok) throw new Error(`TMDB HTTP ${res.status}`);
+      const data = await res.json();
+      cacheSet(opts.cacheKey, data, opts.ttlMs, opts.staleMs);
+      return data;
+    } catch (e) {
+      // Serve stale on failure (C4: never blank screen)
+      const stale = cacheGet<unknown>(opts.cacheKey);
+      if (stale) return stale.value;
+      throw e;
+    } finally {
+      inflight.delete(opts.cacheKey);
+    }
+  })();
+  inflight.set(opts.cacheKey, p);
+  return p;
 }
+
+// In-flight upstream fetches, keyed by cache key (single-flight dedup).
+const inflight = new Map<string, Promise<unknown>>();
 
 const H = 3600_000;
 const D = 24 * H;

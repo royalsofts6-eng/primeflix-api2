@@ -37,14 +37,16 @@ export function nodeHeaderGetter(req: any): HeaderGetter {
 }
 
 export function readBody(req: any): Promise<string> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let data = "";
     req.on("data", (c: any) => {
       data += c;
       if (data.length > 64 * 1024) {
-        // 64KB cap — auth bodies are tiny
+        // 64KB cap — auth bodies are tiny. Destroy and fail LOUDLY with 413
+        // (the old code resolved truncated data and produced a misleading
+        // BAD_SIGNATURE instead).
         req.destroy();
-        resolve(data);
+        reject(new Error("request body too large"));
       }
     });
     req.on("end", () => resolve(data));
@@ -62,7 +64,9 @@ export async function authGatePlain(
   pathname: string,
   header: HeaderGetter,
   clientIp: string,
-  bodyText = ""
+  bodyText = "",
+  /** raw query string (bound into the HMAC signature) */
+  query = ""
 ): Promise<GateResult> {
   // ── Mode 1: day-1 API key ──
   const apiKey = process.env.API_KEY;
@@ -75,15 +79,15 @@ export async function authGatePlain(
   }
 
   // ── Mode 2: HMAC signed request ──
-  const check = await verifyHmacParts(method, pathname, header, bodyText);
+  const check = await verifyHmacParts(method, pathname, header, bodyText, query);
   if (!check.ok) {
     return { ok: false, status: 401, code: check.code, error: check.error };
   }
-  // Revocation on expensive endpoints
-  if (pathname.startsWith("/v1/stream/") && check.memberRef) {
-    if (await isMemberRefRevoked(check.memberRef)) {
-      return { ok: false, status: 403, code: "REVOKED", error: "member key revoked" };
-    }
+  // Revocation is enforced on EVERY authenticated route — a revoked member
+  // is cut off immediately, not just on /v1/stream/* (their old JWTs die at
+  // the 24h expiry at the latest).
+  if (check.memberRef && (await isMemberRefRevoked(check.memberRef))) {
+    return { ok: false, status: 403, code: "REVOKED", error: "member key revoked" };
   }
   const rl = checkRateLimit(pathname, check.memberRef || "unknown");
   if (!rl.allowed) {
@@ -124,8 +128,12 @@ export async function registerPlain(bodyText: string, clientIp: string): Promise
   };
 }
 
-/** POST /v1/auth/refresh */
-export async function refreshPlain(bodyText: string): Promise<{ status: number; json: unknown }> {
+/** POST /v1/auth/refresh — rate-limited by IP (a stolen token must not be
+ *  refreshable at machine speed; refresh also re-checks revocation). */
+export async function refreshPlain(bodyText: string, clientIp: string): Promise<{ status: number; json: unknown }> {
+  const rl = checkRateLimit("/v1/auth/refresh", `ip:${clientIp}`);
+  if (!rl.allowed)
+    return { status: 429, json: { success: false, error: "rate limited", code: "RATE_LIMITED" } };
   let body: { token?: string };
   try {
     body = JSON.parse(bodyText || "{}");

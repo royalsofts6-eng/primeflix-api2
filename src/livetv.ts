@@ -5,12 +5,13 @@
  * - Curated channel list (static, always available as fallback)
  * - 12h refresh: fetch dearbulut health-checked M3U playlists,
  *   match curated channels by name, probe streams, cache results.
- * - GET /v1/livetv/channels serves from cache (fast, edge-cached).
- * - GET /v1/cron/livetv-refresh triggers background refresh (Vercel cron).
+ * - GET /v1/livetv/channels serves from cache (fast, private-cached).
+ * - GET /v1/cron/livetv-refresh triggers the refresh (external cron;
+ *   bounded to complete inside Vercel's 60s maxDuration).
  *
- * NOTE: Vercel Hobby cron only allows DAILY schedules. The channel data
- * itself uses 12h TTL + stale-while-revalidate, so on-demand requests
- * trigger refresh every 12h regardless of cron frequency.
+ * There is NO background refresh on serverless: fire-and-forget promises do
+ * not survive the invocation, so getChannels() never pretends to refresh —
+ * it serves cache/CURATED and the cron endpoint is the only refresh trigger.
  */
 
 import { cacheGet, cacheSet } from "./cache.js";
@@ -804,15 +805,139 @@ export interface RefreshResult {
   channels: Channel[];
 }
 
+// Refresh budget: the cron invocation must complete inside Vercel maxDuration
+// (60s, verified 2026-10-08). Whatever hasn't finished by the deadline keeps
+// its previous known-good state (anti-downgrade), and partial results are
+// written to cache — a refresh never returns empty-handed.
+const REFRESH_BUDGET_MS = 50000;
+// Concurrency caps: 63 channels × ~8 candidates with unbounded Promise.all
+// used to fire hundreds of simultaneous fetches. Now: 6 channels at a time,
+// 4 concurrent probes per channel.
+const CHANNEL_BATCH = 6;
+const PROBE_CONCURRENCY = 4;
+const PROBE_TIMEOUT_MS = 6000;
+
+/** Tiny promise pool. */
+function pLimit(n: number) {
+  let active = 0;
+  const queue: (() => void)[] = [];
+  const release = () => {
+    active--;
+    const f = queue.shift();
+    if (f) f();
+  };
+  return async <T>(fn: () => Promise<T>): Promise<T> => {
+    if (active >= n) await new Promise<void>((res) => queue.push(res));
+    active++;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  };
+}
+
+const WATCH_HOSTS = /(^|\.)(youtube\.com|youtu\.be|facebook\.com|fb\.watch|dailymotion\.com|vimeo\.com)$/i;
+
+/**
+ * HLS channels may only ever be fed real stream URLs. Playlist candidates are
+ * never filtered by content-type, and probeUrl() returns true for ANY http
+ * 200 — including youtube.com watch pages. Without this filter a YouTube
+ * page could become an HLS channel's `url` and ExoPlayer would choke on HTML.
+ */
+function isHlsCandidate(url: string): boolean {
+  let host = "";
+  try {
+    host = new URL(url).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (WATCH_HOSTS.test(host)) return false;
+  return /\.m3u8(\?|#|$)/i.test(url);
+}
+
+/**
+ * Refresh ONE channel: harvest playlist candidates, probe, pick best.
+ * Returns null when it produced nothing usable — the caller then keeps the
+ * previous known-good state for that channel.
+ */
+async function refreshOne(
+  ch: Channel,
+  index: Map<string, PlaylistEntry[]>,
+  probeLimit: <T>(fn: () => Promise<T>) => Promise<T>
+): Promise<Channel | null> {
+  const key = norm(ch.name);
+  const candidates: { url: string; logo?: string }[] = [];
+  const seen = new Set<string>();
+
+  const addCandidate = (e: PlaylistEntry) => {
+    // HLS channels: only real .m3u8 stream URLs are eligible (P1-5).
+    // YouTube-type channels resolve at play time and skip this path.
+    if (ch.type === "hls" && !isHlsCandidate(e.url)) return;
+    if (!seen.has(e.url)) {
+      seen.add(e.url);
+      candidates.push({ url: e.url, logo: e.logo });
+    }
+  };
+
+  // Direct name match + common variants
+  const variants = [key, key.replace(/tv$/, ""), key.replace(/^sony/, "set")];
+  for (const v of variants) {
+    const entries = index.get(v);
+    if (entries) {
+      for (const e of entries) addCandidate(e);
+    }
+  }
+
+  // Also try partial matching (e.g. "starplus" in "starplushd")
+  if (candidates.length === 0) {
+    for (const [k, entries] of index) {
+      if (k.includes(key) || key.includes(k)) {
+        for (const e of entries) {
+          if (candidates.length < 5) addCandidate(e);
+        }
+      }
+    }
+  }
+
+  // Logo: curated first, else first playlist tvg-logo found.
+  const harvestedLogo = ch.logo || candidates.find((c) => c.logo)?.logo || "";
+
+  // Keep curated URL as first candidate (it's verified)
+  const all = ch.url ? [{ url: ch.url, logo: ch.logo }, ...candidates] : candidates;
+
+  // YouTube channels: no probing (resolved at play time)
+  if (ch.type === "youtube") {
+    return { ...ch, fallbacks: candidates.slice(0, 3).map((c) => c.url), logo: harvestedLogo };
+  }
+
+  // Probe with bounded concurrency
+  const probes = await Promise.all(
+    all.map((u) => probeLimit(() => probeUrl(u.url, PROBE_TIMEOUT_MS)))
+  );
+  const alive = all.filter((_, i) => probes[i]);
+
+  return {
+    ...ch,
+    url: alive[0]?.url || "",
+    fallbacks: alive.slice(1, 4).map((a) => a.url),
+    logo: harvestedLogo,
+  };
+}
+
 /**
  * Fetch health-checked playlists, match curated channels, probe streams.
- * Runs in background (cron) or on cache miss.
+ * Triggered ONLY by /v1/cron/livetv-refresh (external cron). Completes
+ * inside the 60s maxDuration: bounded concurrency + 50s deadline + partial
+ * results written early.
  */
 export async function refreshChannels(): Promise<RefreshResult> {
-  // 1. Fetch both playlists in parallel
+  const deadline = Date.now() + REFRESH_BUDGET_MS;
+
+  // 1. Fetch both playlists in parallel (inside the budget)
   const [pkText, inText] = await Promise.all([
-    fetchText(PLAYLISTS.pk),
-    fetchText(PLAYLISTS.in),
+    fetchText(PLAYLISTS.pk, 10000),
+    fetchText(PLAYLISTS.in, 10000),
   ]);
 
   // 2. Build name -> entries index
@@ -827,63 +952,28 @@ export async function refreshChannels(): Promise<RefreshResult> {
     }
   }
 
-  // 3. For each curated channel: find playlist matches, probe, pick best
-  const channels: Channel[] = await Promise.all(
-    CURATED.map(async (ch): Promise<Channel> => {
-      const key = norm(ch.name);
-      const candidates: { url: string; logo?: string }[] = [];
-      const seen = new Set<string>();
+  // 3. Refresh channels in bounded batches. Baseline = previous known-good
+  // state (or curated); each batch races the REMAINING budget, so the whole
+  // refresh can never overrun maxDuration. Batches that don't finish in time
+  // simply keep their baseline — partial results are always written.
+  const prev = cacheGet<RefreshResult>(CACHE_KEY)?.value;
+  const prevById = new Map((prev?.channels || []).map((c) => [c.id, c]));
+  const probeLimit = pLimit(PROBE_CONCURRENCY);
+  const channels: Channel[] = CURATED.map((ch) => prevById.get(ch.id) || ch);
 
-      const addCandidate = (e: PlaylistEntry) => {
-        if (!seen.has(e.url)) {
-          seen.add(e.url);
-          candidates.push({ url: e.url, logo: e.logo });
-        }
-      };
-
-      // Direct name match + common variants
-      const variants = [key, key.replace(/tv$/, ""), key.replace(/^sony/, "set")];
-      for (const v of variants) {
-        const entries = index.get(v);
-        if (entries) {
-          for (const e of entries) addCandidate(e);
-        }
-      }
-
-      // Also try partial matching (e.g. "starplus" in "starplushd")
-      if (candidates.length === 0) {
-        for (const [k, entries] of index) {
-          if (k.includes(key) || key.includes(k)) {
-            for (const e of entries) {
-              if (candidates.length < 5) addCandidate(e);
-            }
-          }
-        }
-      }
-
-      // Logo: curated first, else first playlist tvg-logo found.
-      const harvestedLogo = ch.logo || candidates.find((c) => c.logo)?.logo || "";
-
-      // Keep curated URL as first candidate (it's verified)
-      const all = ch.url ? [{ url: ch.url, logo: ch.logo }, ...candidates] : candidates;
-
-      // Probe in parallel, keep alive ones
-      const probes = await Promise.all(all.map((u) => probeUrl(u.url)));
-      const alive = all.filter((_, i) => probes[i]);
-
-      // YouTube channels: no probing (resolved at play time)
-      if (ch.type === "youtube") {
-        return { ...ch, fallbacks: candidates.slice(0, 3).map((c) => c.url), logo: harvestedLogo };
-      }
-
-      return {
-        ...ch,
-        url: alive[0]?.url || "",
-        fallbacks: alive.slice(1, 4).map((a) => a.url),
-        logo: harvestedLogo,
-      };
-    })
-  );
+  for (let i = 0; i < CURATED.length; i += CHANNEL_BATCH) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    const batch = CURATED.slice(i, i + CHANNEL_BATCH);
+    const done = await Promise.race([
+      Promise.all(batch.map((ch) => refreshOne(ch, index, probeLimit))),
+      new Promise<null>((res) => setTimeout(() => res(null), remaining)),
+    ]);
+    if (done === null) break; // budget exhausted mid-batch — baseline kept
+    done.forEach((ch, j) => {
+      if (ch) channels[i + j] = ch;
+    });
+  }
 
   const alive = channels.filter((c) => c.url || c.type === "youtube").length;
   const result: RefreshResult = {
@@ -896,18 +986,17 @@ export async function refreshChannels(): Promise<RefreshResult> {
   // Anti-downgrade guard: a flaky probe run must not nuke the channel list.
   // If this refresh found fewer working channels than the previous cache,
   // restore previously-working URLs so one bad run can't hide channels.
-  const prevEntry = cacheGet<RefreshResult>(CACHE_KEY);
-  const prev = prevEntry?.value;
+  // (Fixed 2026-10-08: the old merge could duplicate the restored URL into
+  // `fallbacks` — the merged list is now deduped with `url` excluded.)
   if (prev && result.alive < prev.alive) {
     const prevByName = new Map(prev.channels.map((c) => [norm(c.name), c]));
     result.channels = result.channels.map((ch) => {
       const p = prevByName.get(norm(ch.name));
       if (p && p.url && !ch.url) {
-        const merged = [...ch.fallbacks];
-        for (const f of [p.url, ...p.fallbacks]) {
-          if (!merged.includes(f) && merged.length < 4) merged.push(f);
-        }
-        return { ...ch, url: p.url, fallbacks: merged.slice(1) };
+        const merged = [p.url, ...p.fallbacks, ...ch.fallbacks].filter(
+          (u, idx, arr) => u && arr.indexOf(u) === idx
+        );
+        return { ...ch, url: p.url, fallbacks: merged.slice(1, 5) };
       }
       return ch;
     });
@@ -930,33 +1019,31 @@ export function hideDead(channels: Channel[]): Channel[] {
   return channels.filter(isPlayable);
 }
 
+/** Curated channels with no playable URL — reported honestly in the
+ *  `pending` array of /v1/livetv/channels instead of silently flickering
+ *  in and out of the list between instances. */
+export function pendingChannels(channels: Channel[]): Channel[] {
+  return channels.filter((c) => !isPlayable(c));
+}
+
 /**
- * Get channels — fast path serves cache, triggers background refresh on stale.
- * Dead channels (empty URL) are auto-hidden from the response.
+ * Get channels — serves cache (fast). On cold start seeds from CURATED.
+ * There is deliberately NO background refresh here: fire-and-forget promises
+ * cannot complete on serverless. /v1/cron/livetv-refresh is the only trigger.
+ * The full channel list (including unavailable ones) is always returned —
+ * the route splits playable vs `pending` honestly.
  */
 export async function getChannels(): Promise<RefreshResult> {
   const cached = cacheGet<RefreshResult>(CACHE_KEY);
-  if (cached && !cached.stale) {
-    const visible = hideDead(cached.value.channels);
-    return { ...cached.value, channels: visible, alive: visible.length };
-  }
-  if (cached && cached.stale) {
-    // Serve stale immediately, refresh in background
-    refreshChannels().catch(() => {});
-    const visible = hideDead(cached.value.channels);
-    return { ...cached.value, channels: visible, alive: visible.length };
-  }
-  // Cold start: serve curated list immediately (fast, avoids Vercel 10s kill),
-  // refresh in background so next request gets probed URLs.
-  const visible = hideDead(CURATED);
+  if (cached) return cached.value;
+  // Cold start: serve curated list immediately (fast), seed the cache.
   const result: RefreshResult = {
     refreshedAt: Date.now(),
     total: CURATED.length,
-    alive: visible.length,
-    channels: visible,
+    alive: hideDead(CURATED).length,
+    channels: CURATED,
   };
   cacheSet(CACHE_KEY, result, TTL_MS, STALE_MS);
-  refreshChannels().catch(() => {});
   return result;
 }
 

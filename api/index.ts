@@ -4,11 +4,11 @@
  */
 import { tmdb, TTL } from "../src/tmdb.js";
 import { resolveStream, providerHealth, availableAudio } from "../src/chain.js";
-import { fzmovies, warmFZMovies, fzStats } from "../src/providers/fzmovies.js";
+import { warmFZMovies, fzStats } from "../src/providers/fzmovies.js";
 import { cacheStats } from "../src/cache.js";
-import { getSeries, getEpisodes, getStreamUrl, NIAZI_TTL } from "../src/niazitv.js";
-import { getChannels, refreshChannels, groupByCategory } from "../src/livetv.js";
-import { securityStats } from "../src/security/middleware.js";
+import { getSeries, getSeasons, getEpisodesForSerie, getStreamUrl, NIAZI_TTL } from "../src/niazitv.js";
+import { getChannels, refreshChannels, groupByCategory, hideDead, pendingChannels } from "../src/livetv.js";
+import { securityStats } from "../src/security/stats.js";
 import {
   authGatePlain,
   nodeHeaderGetter,
@@ -32,9 +32,15 @@ function send(res: any, status: number, body: unknown, headers: Record<string, s
 const ok = (data: unknown) => ({ success: true, data });
 const fail = (error: string, code: string) => ({ success: false, error, code });
 
-function edgeCache(ttlMs: number, staleMs: number): Record<string, string> {
+/**
+ * Authenticated responses are NEVER edge-cached publicly. Vercel keys edge
+ * cache on URL, not on X-API-Key — a `public, s-maxage` response could be
+ * served to a caller with no key at all (auth bypass via CDN). Use
+ * `private` so only the caller's browser caches, never the shared edge.
+ */
+function privateCache(ttlMs: number): Record<string, string> {
   return {
-    "Cache-Control": `public, s-maxage=${Math.floor(ttlMs / 1000)}, stale-while-revalidate=${Math.floor(staleMs / 1000)}`,
+    "Cache-Control": `private, max-age=${Math.floor(ttlMs / 1000)}`,
   };
 }
 
@@ -42,6 +48,10 @@ const num = (v: string | undefined, d: number): number => {
   const n = parseInt(v || "", 10);
   return Number.isFinite(n) && n > 0 ? n : d;
 };
+
+/** TMDB ids are numeric — reject anything else before it reaches upstream URLs. */
+const tmdbId = (v: string | undefined): string | null =>
+  v && /^\d+$/.test(v) ? v : null;
 
 export default async function handler(req: any, res: any) {
   try {
@@ -65,12 +75,12 @@ export default async function handler(req: any, res: any) {
       if (req.method !== "GET" && req.method !== "HEAD") {
         gateBody = await readBody(req);
       }
-      // Also accept ?api_key= query param for day-1 compat
-      const qKey = q.get("api_key");
+      // Auth is header-only: X-API-Key (day-1) or HMAC headers. The old
+      // ?api_key= query fallback is gone — secrets in URLs land in logs.
       const gate = await authGatePlain(req.method || "GET", path, (n) => {
-        if (n === "X-API-Key") return header("X-API-Key") || qKey;
+        if (n === "X-API-Key") return header("X-API-Key");
         return header(n);
-      }, clientIp, gateBody);
+      }, clientIp, gateBody, url.search.slice(1));
       if (!gate.ok) {
         if (gate.retryAfter) res.setHeader("Retry-After", String(gate.retryAfter));
         return send(res, gate.status || 401, fail(gate.error || "unauthorized", gate.code || "UNAUTHORIZED"));
@@ -86,7 +96,8 @@ export default async function handler(req: any, res: any) {
     }
     if (path === "/v1/auth/refresh" && req.method === "POST") {
       const body = await readBody(req);
-      const r = await refreshPlain(body);
+      const r = await refreshPlain(body, clientIp);
+      if (r.status === 429) res.setHeader("Retry-After", "60");
       return send(res, r.status, r.json);
     }
     if (path === "/v1/auth/revoke" && req.method === "POST") {
@@ -119,10 +130,12 @@ export default async function handler(req: any, res: any) {
           "POST /v1/auth/refresh",
           "POST /v1/auth/revoke",
           "GET /v1/niazi/series",
+          "GET /v1/niazi/series/:id/seasons",
           "GET /v1/niazi/series/:id/episodes",
-          "GET /v1/niazi/stream/:serieId/:episodeId",
+          "GET /v1/niazi/stream/:seasonId/:episodeId",
           "GET /v1/livetv/channels",
           "GET /v1/cron/livetv-refresh",
+          "GET /v1/cron/fz-warm?tmdbId=",
         ],
       });
     }
@@ -140,11 +153,11 @@ export default async function handler(req: any, res: any) {
     let m: RegExpMatchArray | null;
     if (path === "/v1/tmdb/trending/movie") {
       const data = await tmdb.trendingMovie(q.get("time_window") || "day");
-      return send(res, 200, ok(data), edgeCache(TTL.trending, TTL.stale7d));
+      return send(res, 200, ok(data), privateCache(TTL.trending));
     }
     if (path === "/v1/tmdb/trending/tv") {
       const data = await tmdb.trendingTv(q.get("time_window") || "day");
-      return send(res, 200, ok(data), edgeCache(TTL.trending, TTL.stale7d));
+      return send(res, 200, ok(data), privateCache(TTL.trending));
     }
     if (path === "/v1/tmdb/discover/movie") {
       // Allowlisted params only (Ali 2026-10-08: Home rails — Hollywood, Bollywood,
@@ -160,38 +173,48 @@ export default async function handler(req: any, res: any) {
         if (v) params[k] = v;
       }
       const data = await tmdb.discoverMovie(params);
-      return send(res, 200, ok(data), edgeCache(TTL.discover, TTL.stale7d));
+      return send(res, 200, ok(data), privateCache(TTL.discover));
     }
     if (path === "/v1/tmdb/movie/upcoming") {
       // Must sit BEFORE the /v1/tmdb/movie/:id regex below.
       const data = await tmdb.upcomingMovies(q.get("region") || "US", q.get("page") || "1");
-      return send(res, 200, ok(data), edgeCache(TTL.discover, TTL.stale7d));
+      return send(res, 200, ok(data), privateCache(TTL.discover));
     }
     if ((m = path.match(/^\/v1\/tmdb\/movie\/([^/]+)$/))) {
-      const data = await tmdb.movie(m[1]);
-      return send(res, 200, ok(data), edgeCache(TTL.details, TTL.stale7d));
+      const id = tmdbId(m[1]);
+      if (!id) return send(res, 400, fail("invalid tmdb id", "BAD_QUERY"));
+      const data = await tmdb.movie(id);
+      return send(res, 200, ok(data), privateCache(TTL.details));
     }
     if ((m = path.match(/^\/v1\/tmdb\/movie\/([^/]+)\/recommendations$/))) {
-      const data = await tmdb.movieRecs(m[1]);
-      return send(res, 200, ok(data), edgeCache(TTL.details, TTL.stale7d));
+      const id = tmdbId(m[1]);
+      if (!id) return send(res, 400, fail("invalid tmdb id", "BAD_QUERY"));
+      const data = await tmdb.movieRecs(id);
+      return send(res, 200, ok(data), privateCache(TTL.details));
     }
     if ((m = path.match(/^\/v1\/tmdb\/tv\/([^/]+)\/season\/([^/]+)$/))) {
-      const data = await tmdb.tvSeason(m[1], num(m[2], 1));
-      return send(res, 200, ok(data), edgeCache(TTL.details, TTL.stale7d));
+      const id = tmdbId(m[1]);
+      if (!id) return send(res, 400, fail("invalid tmdb id", "BAD_QUERY"));
+      const data = await tmdb.tvSeason(id, num(m[2], 1));
+      return send(res, 200, ok(data), privateCache(TTL.details));
     }
     if ((m = path.match(/^\/v1\/tmdb\/tv\/([^/]+)\/recommendations$/))) {
-      const data = await tmdb.tvRecs(m[1]);
-      return send(res, 200, ok(data), edgeCache(TTL.details, TTL.stale7d));
+      const id = tmdbId(m[1]);
+      if (!id) return send(res, 400, fail("invalid tmdb id", "BAD_QUERY"));
+      const data = await tmdb.tvRecs(id);
+      return send(res, 200, ok(data), privateCache(TTL.details));
     }
     if ((m = path.match(/^\/v1\/tmdb\/tv\/([^/]+)$/))) {
-      const data = await tmdb.tv(m[1]);
-      return send(res, 200, ok(data), edgeCache(TTL.details, TTL.stale7d));
+      const id = tmdbId(m[1]);
+      if (!id) return send(res, 400, fail("invalid tmdb id", "BAD_QUERY"));
+      const data = await tmdb.tv(id);
+      return send(res, 200, ok(data), privateCache(TTL.details));
     }
     if (path === "/v1/tmdb/search/multi") {
       const query = q.get("query") || "";
       if (query.length < 2) return send(res, 400, fail("query too short", "BAD_QUERY"));
       const data = await tmdb.search(query, q.get("page") || "1");
-      return send(res, 200, ok(data), edgeCache(TTL.search, TTL.stale1d));
+      return send(res, 200, ok(data), privateCache(TTL.search));
     }
 
     // Available audio languages (Ali 2026-10-08: dub button shows ONLY what
@@ -200,71 +223,96 @@ export default async function handler(req: any, res: any) {
     // for backward compat with older apps.
     // MUST sit before the /v1/stream/movie/:tmdbId regex below.
     if ((m = path.match(/^\/v1\/stream\/movie\/([^/]+)\/languages$/))) {
-      const info = await availableAudio(m[1], "movie");
+      const id = tmdbId(m[1]);
+      if (!id) return send(res, 400, fail("invalid tmdb id", "BAD_QUERY"));
+      const info = await availableAudio(id, "movie");
       return send(res, 200, ok({ audio: info.audio, original: info.original, playing: info.playing, labels: info.labels }), { "Cache-Control": "no-store" });
     }
     if ((m = path.match(/^\/v1\/stream\/tv\/([^/]+)\/([^/]+)\/([^/]+)\/languages$/))) {
-      const info = await availableAudio(m[1], "tv", num(m[2], 1), num(m[3], 1));
+      const id = tmdbId(m[1]);
+      if (!id) return send(res, 400, fail("invalid tmdb id", "BAD_QUERY"));
+      const info = await availableAudio(id, "tv", num(m[2], 1), num(m[3], 1));
       return send(res, 200, ok({ audio: info.audio, original: info.original, playing: info.playing, labels: info.labels }), { "Cache-Control": "no-store" });
     }
 
     // Stream resolution (NEVER cache — signed URLs expire)
     // ?audio=hi → Hindi-dubbed only (VidZee); ?audio=en → English/original only.
     if ((m = path.match(/^\/v1\/stream\/movie\/([^/]+)$/))) {
-      const data = await resolveStream(m[1], "movie", undefined, undefined, q.get("audio") || undefined);
+      const id = tmdbId(m[1]);
+      if (!id) return send(res, 400, fail("invalid tmdb id", "BAD_QUERY"));
+      const data = await resolveStream(id, "movie", undefined, undefined, q.get("audio") || undefined);
       return send(res, 200, ok(data), { "Cache-Control": "no-store" });
     }
     if ((m = path.match(/^\/v1\/stream\/tv\/([^/]+)\/([^/]+)\/([^/]+)$/))) {
-      const data = await resolveStream(m[1], "tv", num(m[2], 1), num(m[3], 1), q.get("audio") || undefined);
+      const id = tmdbId(m[1]);
+      if (!id) return send(res, 400, fail("invalid tmdb id", "BAD_QUERY"));
+      const data = await resolveStream(id, "tv", num(m[2], 1), num(m[3], 1), q.get("audio") || undefined);
       return send(res, 200, ok(data), { "Cache-Control": "no-store" });
     }
 
     // NiaziTV Turkish dramas (stream URLs NEVER cached — signed/expiring)
     if (path === "/v1/niazi/series") {
       const data = await getSeries();
-      return send(res, 200, ok(data), edgeCache(NIAZI_TTL.series, NIAZI_TTL.staleSeries));
+      return send(res, 200, ok(data), privateCache(NIAZI_TTL.series));
+    }
+    if ((m = path.match(/^\/v1\/niazi\/series\/([^/]+)\/seasons$/))) {
+      const data = await getSeasons(m[1]);
+      return send(res, 200, ok(data), privateCache(NIAZI_TTL.seasons));
     }
     if ((m = path.match(/^\/v1\/niazi\/series\/([^/]+)\/episodes$/))) {
-      const data = await getEpisodes(m[1]);
-      return send(res, 200, ok(data), edgeCache(NIAZI_TTL.episodes, NIAZI_TTL.staleEpisodes));
+      // Series id (NOT season id — aggregates every season page).
+      const data = await getEpisodesForSerie(m[1]);
+      return send(res, 200, ok(data), privateCache(NIAZI_TTL.episodes));
     }
     if ((m = path.match(/^\/v1\/niazi\/stream\/([^/]+)\/([^/]+)$/))) {
       const data = await getStreamUrl(m[1], m[2]);
       return send(res, 200, ok(data), { "Cache-Control": "no-store" });
     }
 
-    // Live TV channels (12h cache + 7d stale; cron refreshes in background)
+    // Live TV channels. Playable channels go in `groups` (unchanged
+    // contract); curated channels with no playable URL are reported honestly
+    // in `pending` instead of silently flickering in/out between instances.
     if (path === "/v1/livetv/channels") {
       const data = await getChannels();
+      const playable = hideDead(data.channels);
+      const pending = pendingChannels(data.channels).map((c) => ({
+        id: c.id,
+        name: c.name,
+        category: c.category,
+        country: c.country,
+        logo: c.logo,
+        reason: "awaiting-source",
+      }));
       return send(res, 200, ok({
         refreshedAt: data.refreshedAt,
         total: data.total,
-        alive: data.alive,
-        groups: groupByCategory(data.channels),
-      }), edgeCache(12 * 3600 * 1000, 7 * 24 * 3600 * 1000));
+        alive: playable.length,
+        groups: groupByCategory(playable),
+        pending,
+      }), privateCache(12 * 3600 * 1000));
     }
     if (path === "/v1/cron/livetv-refresh") {
-      const secret = q.get("secret") || header("x-cron-secret");
+      // CRON_SECRET is header-only — never in the query string (logged).
+      const secret = header("x-cron-secret");
       if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
         return send(res, 401, fail("unauthorized", "BAD_CRON_SECRET"));
       }
       const data = await refreshChannels();
       return send(res, 200, ok({ refreshedAt: data.refreshedAt, total: data.total, alive: data.alive }));
     }
-    // FZMovies cache warmer (CRON_SECRET protected). The 4-hop FZMovies scrape
-    // takes 35-60s — too slow for the 10s request path — so popular Hindi
-    // titles are pre-resolved here and served from cache (10h TTL).
-    // Usage: GET /v1/cron/fz-warm?tmdbId=299536&secret=...
+    // FZMovies cache warmer (CRON_SECRET protected, header-only).
+    // Bounded: single-attempt scrape with a hard 52s deadline so the
+    // invocation ALWAYS completes inside Vercel's 60s maxDuration.
+    // Usage: GET /v1/cron/fz-warm?tmdbId=299536  (x-cron-secret header)
     if (path === "/v1/cron/fz-warm") {
-      const secret = q.get("secret") || header("x-cron-secret");
+      const secret = header("x-cron-secret");
       if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
         return send(res, 401, fail("unauthorized", "BAD_CRON_SECRET"));
       }
-      const tmdbId = q.get("tmdbId") || "";
-      if (!tmdbId) return send(res, 400, fail("tmdbId required", "BAD_QUERY"));
-      await warmFZMovies(tmdbId, "movie");
-      const hit = await fzmovies(tmdbId, "movie");
-      return send(res, 200, ok({ tmdbId, warmed: !!hit, qualities: hit?.qualities?.length || 0 }));
+      const id = tmdbId(q.get("tmdbId") || undefined);
+      if (!id) return send(res, 400, fail("tmdbId required (numeric)", "BAD_QUERY"));
+      const warm = await warmFZMovies(id, "movie", true);
+      return send(res, 200, ok({ tmdbId: id, warmed: warm.warmed, reason: warm.reason, qualities: warm.qualities || 0 }));
     }
 
     return send(res, 404, fail("not found", "NOT_FOUND"));
@@ -272,7 +320,13 @@ export default async function handler(req: any, res: any) {
     const msg = e instanceof Error ? e.message : String(e);
     let code = "UPSTREAM_ERROR";
     let status = 500;
-    if (msg.includes("hindi dubbed not available")) {
+    if (msg.includes("request body too large")) {
+      code = "PAYLOAD_TOO_LARGE";
+      status = 413;
+    } else if (msg.startsWith("invalid ") || msg.includes("invalid tmdb id")) {
+      code = "BAD_QUERY";
+      status = 400;
+    } else if (msg.includes("hindi dubbed not available")) {
       code = "HINDI_UNAVAILABLE";
       status = 502;
     } else if (msg.includes("TMDB rate limited")) {

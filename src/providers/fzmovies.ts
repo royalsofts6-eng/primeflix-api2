@@ -15,7 +15,10 @@
  * - Keys expire in ~60s: all 4 hops MUST run back-to-back in one invocation.
  * - Final MP4 links valid 12h → we cache 10h.
  * - Full chain takes 35-60s (site is slow) → NEVER block a user request on it.
- *   Request path is cache-only; misses trigger best-effort background warm.
+ *   Request path is cache-only; warming happens ONLY via /v1/cron/fz-warm,
+ *   which runs a bounded single-attempt scrape inside the Vercel 60s
+ *   maxDuration (verified 2026-10-08). Fire-and-forget "background" warming
+ *   from the request path does NOT work on serverless and was removed.
  * - Mirror hosts are DNS-sinkholed from datacenter IPs, but phones
  *   (residential/mobile IP) resolve them fine. Backend only extracts URLs,
  *   never fetches video bytes.
@@ -37,9 +40,16 @@ const FZ_FALLBACKS = (process.env.FZ_FALLBACK_URLS || "")
   .filter(Boolean);
 
 const UA = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36";
-// 40s per hop (was 25s): site takes 7-15s normally, spikes to 30s+ when flaky.
-// Verified 2026-10-08: search POST took 14.7s on a good attempt.
+// Per-hop fetch timeout for the full interactive scrape (Ali 2026-10-08:
+// site takes 7-15s normally, spikes to 30s+ when flaky; search POST took
+// 14.7s on a good attempt).
 const HOP_TIMEOUT_MS = 40000;
+// Bounded warm (used by /v1/cron/fz-warm): the whole warm MUST complete
+// inside Vercel maxDuration (60s, verified 2026-10-08 on both clusters).
+// One attempt, tighter hops, hard overall deadline — the cron caller retries
+// on transient failures instead of one invocation gambling 300s+.
+const WARM_HOP_TIMEOUT_MS = 12000;
+const WARM_OVERALL_MS = 52000;
 const CACHE_TTL_MS = 10 * 60 * 60_000; // 10h (links live 12h)
 
 // ── Circuit breaker: 3 consecutive fails → 15 min cooldown ───────────────────
@@ -79,7 +89,8 @@ class Jar {
 async function fzFetch(
   jar: Jar,
   url: string,
-  init: RequestInit & { referer?: string } = {}
+  init: RequestInit & { referer?: string } = {},
+  timeoutMs: number = HOP_TIMEOUT_MS
 ): Promise<string> {
   const headers: Record<string, string> = {
     "User-Agent": UA,
@@ -92,7 +103,7 @@ async function fzFetch(
   const res = await fetch(url, {
     ...init,
     headers: { ...headers, ...(init.headers as Record<string, string>) },
-    signal: AbortSignal.timeout(HOP_TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   jar.ingest(res.headers.get("set-cookie"));
   if (!res.ok) throw new Error(`fz http ${res.status} for ${url}`);
@@ -205,13 +216,20 @@ function mp4Quality(url: string): string {
 /**
  * Full live 4-hop resolve. SLOW (35-60s) — never call in the request path.
  * Throws on any failure (caller decides fallback).
+ *
+ * @param opts.hopTimeoutMs per-hop fetch timeout (default 40s)
+ * @param opts.attempts     full-chain attempts with a 3s breather (default 2)
  */
 export async function fzmoviesLive(
   tmdbId: string,
-  type: "movie" | "tv"
+  type: "movie" | "tv",
+  opts: { hopTimeoutMs?: number; attempts?: number } = {}
 ): Promise<ProviderResult | null> {
   if (type !== "movie") return null; // FZMovies is movie-focused
   if (circuitOpen()) return null;
+
+  const hopTimeoutMs = opts.hopTimeoutMs ?? HOP_TIMEOUT_MS;
+  const attempts = opts.attempts ?? 2;
 
   // Resolve title + year from TMDB (cached 24h)
   let title = "";
@@ -228,25 +246,31 @@ export async function fzmoviesLive(
 
   const bases = [FZ_BASE, ...FZ_FALLBACKS];
   let lastErr: unknown = null;
-  // Two attempts: the site is flaky (verified 2026-10-08: search sometimes
-  // 200 in 7s, sometimes 30s+ timeout). One retry with a breather often works.
-  for (let attempt = 0; attempt < 2; attempt++) {
+  // Two attempts by default: the site is flaky (verified 2026-10-08: search
+  // sometimes 200 in 7s, sometimes 30s+ timeout). One retry with a breather
+  // often works. The bounded cron warm uses attempts: 1.
+  for (let attempt = 0; attempt < attempts; attempt++) {
     for (const base of bases) {
       try {
-        const result = await resolveOnBase(base, title, year);
+        const result = await resolveOnBase(base, title, year, hopTimeoutMs);
         recordOk();
         return result;
       } catch (e) {
         lastErr = e;
       }
     }
-    if (attempt === 0) await new Promise((r) => setTimeout(r, 3000));
+    if (attempt === 0 && attempts > 1) await new Promise((r) => setTimeout(r, 3000));
   }
   recordFail();
   throw lastErr instanceof Error ? lastErr : new Error("fzmovies resolve failed");
 }
 
-async function resolveOnBase(base: string, title: string, year: string): Promise<ProviderResult | null> {
+async function resolveOnBase(
+  base: string,
+  title: string,
+  year: string,
+  hopTimeoutMs: number
+): Promise<ProviderResult | null> {
   const jar = new Jar();
 
   // Hop 1: search (prefer Hindi-dubbed category)
@@ -259,7 +283,7 @@ async function resolveOnBase(base: string, title: string, year: string): Promise
     body: form,
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     referer: `${base}/`,
-  });
+  }, hopTimeoutMs);
   let hits = parseSearch(html).filter((h) => scoreHit(h, title, year) > 0);
 
   // Fallback: Bollywood category (for Bollywood originals VidZee missed)
@@ -273,7 +297,7 @@ async function resolveOnBase(base: string, title: string, year: string): Promise
       body: form2,
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       referer: `${base}/csearch.php`,
-    });
+    }, hopTimeoutMs);
     hits = parseSearch(html).filter((h) => scoreHit(h, title, year) > 0);
   }
   if (hits.length === 0) throw new Error("fzmovies: no search hits");
@@ -283,20 +307,20 @@ async function resolveOnBase(base: string, title: string, year: string): Promise
 
   // Hop 2: detail page → quality options
   const detailUrl = `${base}/${best.slug}`;
-  html = await fzFetch(jar, detailUrl, { referer: `${base}/csearch.php` });
+  html = await fzFetch(jar, detailUrl, { referer: `${base}/csearch.php` }, hopTimeoutMs);
   const opts = parseDlOptions(html);
   if (opts.length === 0) throw new Error("fzmovies: no download options");
   opts.sort((a, b) => qualityRank(b) - qualityRank(a));
   const opt = opts[0];
 
   // Hop 3: download1 → download link
-  html = await fzFetch(jar, `${base}/${opt.url}`, { referer: detailUrl });
+  html = await fzFetch(jar, `${base}/${opt.url}`, { referer: detailUrl }, hopTimeoutMs);
   let m = html.match(/href="(download\.php\?downloadkey=[^"]+)"/) || html.match(/id="downloadlink"[^>]*href="([^"]+)"/);
   if (!m) throw new Error("fzmovies: no download.php link");
   const dlUrl = `${base}/${m[1]}`;
 
   // Hop 4: download page → direct MP4 mirrors
-  html = await fzFetch(jar, dlUrl, { referer: `${base}/${opt.url}` });
+  html = await fzFetch(jar, dlUrl, { referer: `${base}/${opt.url}` }, hopTimeoutMs);
   let mp4s = [...html.matchAll(/name="download1"[^>]*value="([^"]+)"/g)].map((x) => x[1]);
   if (mp4s.length === 0) {
     mp4s = [...html.matchAll(/(https:\/\/[^"']+\.mp4[^"']*)/g)].map((x) => x[1]);
@@ -339,20 +363,66 @@ export const fzmovies: ProviderFn = async (tmdbId, type) => {
 };
 
 /**
- * Background warm: runs the full live chain and caches the result (10h).
- * Safe to call unawaited — never throws.
+ * Bounded warm for /v1/cron/fz-warm: runs the live chain with a hard overall
+ * deadline so the invocation ALWAYS completes inside Vercel's 60s
+ * maxDuration. Single attempt, 12s hops — the cron caller retries on
+ * transient failures.
+ *
+ * Single-flight: concurrent warms for the same title collapse into one
+ * (prevents double 35-60s scrapes from two cron triggers / two requests).
+ *
+ * Returns an honest result — never throws.
  */
-export async function warmFZMovies(tmdbId: string, type: "movie" | "tv"): Promise<void> {
-  if (type !== "movie") return;
-  if (circuitOpen()) return;
-  if (cacheGet(cacheKey(tmdbId))) return; // already warm
+export interface WarmResult {
+  warmed: boolean;
+  /** cached | warmed | already-warming | circuit-open | timeout | failed | not-movie */
+  reason: string;
+  qualities?: number;
+}
+
+const warming = new Set<string>();
+
+export async function warmFZMovies(
+  tmdbId: string,
+  type: "movie" | "tv",
+  bounded = false
+): Promise<WarmResult> {
+  if (type !== "movie") return { warmed: false, reason: "not-movie" };
+  if (circuitOpen()) return { warmed: false, reason: "circuit-open" };
+  const key = cacheKey(tmdbId);
+  const existing = cacheGet<ProviderResult>(key);
+  if (existing) return { warmed: true, reason: "cached", qualities: existing.value.qualities.length };
+  if (warming.has(key)) return { warmed: false, reason: "already-warming" };
+  warming.add(key);
   try {
-    const r = await fzmoviesLive(tmdbId, type);
-    if (r && r.qualities.length > 0) {
-      cacheSet(cacheKey(tmdbId), r, CACHE_TTL_MS, 0);
-    }
-  } catch {
-    // best-effort: failures are recorded by the circuit breaker inside
+    const run = (async (): Promise<WarmResult> => {
+      try {
+        const r = await fzmoviesLive(
+          tmdbId,
+          type,
+          bounded ? { hopTimeoutMs: WARM_HOP_TIMEOUT_MS, attempts: 1 } : {}
+        );
+        if (r && r.qualities.length > 0) {
+          cacheSet(key, r, CACHE_TTL_MS, 0);
+          return { warmed: true, reason: "warmed", qualities: r.qualities.length };
+        }
+        return { warmed: false, reason: "failed" };
+      } catch {
+        // failures are recorded by the circuit breaker inside fzmoviesLive
+        return { warmed: false, reason: "failed" };
+      }
+    })();
+    if (!bounded) return run;
+    // Hard deadline: the cron invocation must respond inside maxDuration.
+    const r = await Promise.race([
+      run,
+      new Promise<WarmResult>((res) =>
+        setTimeout(() => res({ warmed: false, reason: "timeout" }), WARM_OVERALL_MS)
+      ),
+    ]);
+    return r;
+  } finally {
+    warming.delete(key);
   }
 }
 

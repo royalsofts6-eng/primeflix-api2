@@ -1,9 +1,10 @@
 /**
  * 5-provider chain with PARALLEL racing + circuit breaker + health tracking.
  *
- * CRITICAL: Vercel Hobby has a 10s function timeout. Sequentially trying
- * 5 providers would exceed it. We race the top-3 healthiest providers in
- * parallel with an 8s overall budget and take the first success.
+ * CRITICAL: Vercel maxDuration is 60s (verified 2026-10-08 on both clusters).
+ * Sequentially trying 5 providers would exceed it. We race the top-3
+ * healthiest providers in parallel with an 8s overall budget and take the
+ * first success.
  *
  * Chain (final plan v1.0 — NHD dead, 111Movies unverified, both removed):
  *   1. VidLink  ✅ verified 2026-10-08
@@ -17,7 +18,7 @@
 import { vidlink } from "./providers/vidlink.js";
 import { vaplayer } from "./providers/vaplayer.js";
 import { vidzee } from "./providers/vidzee.js";
-import { fzmovies, warmFZMovies } from "./providers/fzmovies.js";
+import { fzmovies } from "./providers/fzmovies.js";
 import { tmdb } from "./tmdb.js";
 import type { ProviderFn, ProviderResult } from "./providers/types.js";
 import { NotAvailableError } from "./providers/types.js";
@@ -42,6 +43,8 @@ const vaplayerWithImdb: ProviderFn = async (tmdbId, type, season, episode) => {
 interface ProviderEntry {
   name: string;
   fn: ProviderFn;
+  /** Unimplemented providers: "no result" is not a failure — don't trip circuits. */
+  stub?: boolean;
 }
 
 // ── Health tracking ─────────────────────────────────────────────────────────
@@ -104,10 +107,10 @@ export function providerHealth(): Record<string, unknown> {
 // ── Chain ───────────────────────────────────────────────────────────────────
 const PROVIDERS: ProviderEntry[] = [
   { name: "vidlink", fn: vidlink },
-  { name: "vaplayer", fn: vaplayerWithImdb },
-  { name: "vidrock", fn: notYet("vidrock") },
-  { name: "vidsrc", fn: notYet("vidsrc") },
-  { name: "screenscape", fn: notYet("screenscape") },
+  { name: "vaplayer", fn: vaplayerWithImdb, stub: true },
+  { name: "vidrock", fn: notYet("vidrock"), stub: true },
+  { name: "vidsrc", fn: notYet("vidsrc"), stub: true },
+  { name: "screenscape", fn: notYet("screenscape"), stub: true },
 ];
 
 function rankProviders(): ProviderEntry[] {
@@ -134,23 +137,27 @@ async function tryProvider(
   tmdbId: string,
   type: "movie" | "tv",
   season?: number,
-  episode?: number
+  episode?: number,
+  /** When false, skip health recording (race losers that finished after
+   *  the winner was returned must not pollute provider stats). */
+  recordStats: () => boolean = () => true
 ): Promise<ProviderResult | null> {
   const t0 = Date.now();
-  try {
-    const r = await p.fn(tmdbId, type, season, episode);
-    if (r && r.qualities.length > 0) {
-      recordSuccess(p.name, Date.now() - t0);
-      return r;
+  const ok = (r: ProviderResult | null): ProviderResult | null => {
+    if (recordStats()) {
+      if (r && r.qualities.length > 0) recordSuccess(p.name, Date.now() - t0);
+      else if (!p.stub) recordFail(p.name);
     }
-    recordFail(p.name);
-    return null;
+    return r && r.qualities.length > 0 ? r : null;
+  };
+  try {
+    return ok(await p.fn(tmdbId, type, season, episode));
   } catch (e) {
     // "Not available" (e.g. VidZee 404/502 = no Hindi for this title) is a
     // correct provider response, NOT a failure. Don't trip the circuit
     // breaker — otherwise 5x "no Hindi" would block Hindi for everyone.
     if (e instanceof NotAvailableError) return null;
-    recordFail(p.name);
+    if (recordStats() && !p.stub) recordFail(p.name);
     return null;
   }
 }
@@ -166,8 +173,9 @@ export interface ChainResult extends ProviderResult {
  *
  * Hindi chain (Ali 2026-10-08): VidZee → FZMovies → (VidLink English).
  * FZMovies is a PROPER Hindi tier, not a backup. Its 4-hop scrape takes
- * 35-60s (Vercel Hobby = 10s), so the request path only reads its cache;
- * misses trigger a best-effort background warm for next time.
+ * 35-60s, so the request path only reads its cache; warming happens ONLY via
+ * /v1/cron/fz-warm (bounded to the 60s maxDuration). Fire-and-forget
+ * "background" warming was removed — it cannot complete on serverless.
  *
  * @param audio "hi" = Hindi (VidZee → FZMovies cache → VidLink when the
  *   original language itself is Hindi, e.g. Bollywood titles; throws
@@ -203,14 +211,14 @@ export async function resolveStream(
     // Bollywood/Hindi-original titles: VidLink serves the Hindi ORIGINAL, so
     // ?audio=hi is satisfiable even with no dubbed copy (Ali 2026-10-08:
     // Drishyam showed "English" — the original IS Hindi).
-    if ((await originalLanguage(tmdbId, type)) === "hi") {
+    if ((await originalLanguage(tmdbId, type)) === "hi" && !circuitOpen("vidlink")) {
       const vl = await tryProvider({ name: "vidlink", fn: vidlink }, tmdbId, type, season, episode);
       if (vl) {
         return { ...vl, resolvedBy: "vidlink", latencyMs: Date.now() - t0 };
       }
     }
-    // Miss: warm in background for next time, honest error now.
-    void warmFZMovies(tmdbId, type).catch(() => {});
+    // Miss: honest error now. The title can be warmed via /v1/cron/fz-warm
+    // (request-path background warming cannot complete on serverless).
     throw new Error("hindi dubbed not available");
   }
 
@@ -218,8 +226,8 @@ export async function resolveStream(
   const hindiEntry: ProviderEntry = { name: "vidzee", fn: vidzee };
   if (!skipHindi && !circuitOpen(hindiEntry.name)) {
     // Hindi-first (Ali 2026-10-08): try VidZee Hindi-dubbed before the English chain.
-    // VidZee has a short internal fetch timeout (3.5s) so the Vercel Hobby 10s
-    // budget stays safe; on miss we fall through to FZMovies cache, then chain.
+    // VidZee has a short internal fetch timeout (7s) so the 60s budget stays
+    // safe; on miss we fall through to FZMovies cache, then chain.
     const hindi = await tryProvider(hindiEntry, tmdbId, type, season, episode);
     if (hindi) {
       return { ...hindi, resolvedBy: hindiEntry.name, latencyMs: Date.now() - t0 };
@@ -230,8 +238,7 @@ export async function resolveStream(
     if (fz) {
       return { ...fz, resolvedBy: fzEntry.name, latencyMs: Date.now() - t0 };
     }
-    // Cache miss: warm in background while the English chain serves now.
-    void warmFZMovies(tmdbId, type).catch(() => {});
+    // Cache miss: the English chain serves now; Hindi warms via cron only.
   }
 
   const ranked = rankProviders();
@@ -240,24 +247,61 @@ export async function resolveStream(
   const racers = ranked.slice(0, RACE_COUNT);
   const rest = ranked.slice(RACE_COUNT);
 
+  // Stats gate: providers that finish AFTER the race settled (timeout or a
+  // faster winner) must not record success/fail — their numbers describe a
+  // request the user never saw and skew /health rankings.
+  const raceBox = { settled: false };
+  const gate = () => !raceBox.settled;
+
   const attempt = async (list: ProviderEntry[]): Promise<ProviderResult | null> => {
-    const results = await Promise.all(list.map((p) => tryProvider(p, tmdbId, type, season, episode)));
-    return results.find((r) => r !== null) ?? null;
+    // True race: resolve on the FIRST success, not when the slowest racer
+    // finishes. Losers keep running but their stats are dropped by the gate.
+    return new Promise((resolve) => {
+      let pending = list.length;
+      let done = false;
+      for (const p of list) {
+        tryProvider(p, tmdbId, type, season, episode, gate).then((r) => {
+          if (done) return;
+          if (r) {
+            done = true;
+            resolve(r);
+          } else if (--pending === 0) {
+            done = true;
+            resolve(null);
+          }
+        });
+      }
+      if (list.length === 0) resolve(null);
+    });
   };
 
   // Round 1: race top-3 in parallel with overall budget
   const winner = await Promise.race([
-    attempt(racers),
-    new Promise<null>((res) => setTimeout(() => res(null), OVERALL_BUDGET_MS)),
+    attempt(racers).then((r) => {
+      raceBox.settled = true;
+      return r;
+    }),
+    new Promise<null>((res) =>
+      setTimeout(() => {
+        raceBox.settled = true;
+        res(null);
+      }, OVERALL_BUDGET_MS)
+    ),
   ]);
 
   let result = winner;
-  // Round 2: if round 1 failed, try the rest sequentially (fast fail each)
+  // Round 2: if round 1 failed, try the rest sequentially. Each provider is
+  // capped by the REMAINING overall budget — the old code only checked the
+  // budget *between* providers, so one slow provider could blow past it.
   if (!result) {
     for (const p of rest) {
-      result = await tryProvider(p, tmdbId, type, season, episode);
+      const remaining = OVERALL_BUDGET_MS + 1500 - (Date.now() - t0);
+      if (remaining <= 0) break;
+      result = await Promise.race([
+        tryProvider(p, tmdbId, type, season, episode),
+        new Promise<null>((res) => setTimeout(() => res(null), Math.min(remaining, 9000))),
+      ]);
       if (result) break;
-      if (Date.now() - t0 > OVERALL_BUDGET_MS + 1500) break;
     }
   }
 

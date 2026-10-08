@@ -10,8 +10,15 @@ const enc = new TextEncoder();
 const dec = new TextDecoder();
 
 function jwtSecret(): string {
-  const s = process.env.JWT_SECRET || process.env.API_SECRET || process.env.API_KEY || "";
+  // FAIL CLOSED: JWT signing key must be a real secret. It used to fall back
+  // to API_KEY — the APK-embedded key — letting anyone holding the app key
+  // mint arbitrary JWTs. JWT_SECRET falls back to API_SECRET (both are
+  // server-only env vars), never to API_KEY.
+  const s = process.env.JWT_SECRET || process.env.API_SECRET || "";
   if (!s) throw new Error("JWT secret not configured (set JWT_SECRET or API_SECRET)");
+  if (process.env.API_KEY && s === process.env.API_KEY) {
+    throw new Error("JWT secret must differ from API_KEY");
+  }
   return s;
 }
 

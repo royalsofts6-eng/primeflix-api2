@@ -8,7 +8,8 @@
  *   X-PF-Signature:  <hex HMAC-SHA256>
  *
  * Signature input (canonical):
- *   timestamp + "\n" + METHOD + "\n" + pathname + "\n" + sha256hex(body) + "\n" + deviceId
+ *   timestamp + "\n" + METHOD + "\n" + pathname + "\n" + sortedQuery + "\n"
+ *     + sha256hex(body) + "\n" + deviceId
  *
  * Device secret is derived deterministically (see devices.ts):
  *   deviceSecret = HMAC-SHA256(API_SECRET, "pf-device:" + memberRef + ":" + deviceId)
@@ -33,7 +34,15 @@ export interface HmacCheck {
 }
 
 function masterSecret(): string {
-  return process.env.API_SECRET || process.env.API_KEY || "";
+  // FAIL CLOSED: the device-secret HMAC key MUST be a real secret. It used
+  // to fall back to API_KEY — the same key hardcoded in the APK — which let
+  // anyone holding the app key derive any device secret. Never again.
+  const s = process.env.API_SECRET || "";
+  if (!s) throw new Error("API_SECRET not configured");
+  if (process.env.API_KEY && s === process.env.API_KEY) {
+    throw new Error("API_SECRET must differ from API_KEY");
+  }
+  return s;
 }
 
 export async function deriveDeviceSecretFromRef(
@@ -51,6 +60,9 @@ export interface HmacRequestParts {
   /** header lookup — case-insensitive */
   header: (name: string) => string | null;
   bodyText: string;
+  /** raw query string (sorted); bound into the signature so signed GET
+   *  params can't be swapped inside the replay window */
+  query?: string;
 }
 
 function getHeader(h: Headers | ((name: string) => string | null), name: string): string {
@@ -62,7 +74,9 @@ export async function verifyHmacParts(
   method: string,
   pathname: string,
   header: (name: string) => string | null,
-  bodyText: string
+  bodyText: string,
+  /** raw query string (e.g. "audio=hi&page=2"); sorted before signing */
+  query = ""
 ): Promise<HmacCheck> {
   const deviceId = header("X-PF-Device") || "";
   const tsRaw = header("X-PF-Timestamp") || "";
@@ -97,9 +111,16 @@ export async function verifyHmacParts(
     return { ok: false, code: "NO_API_SECRET", error: "server misconfigured" };
   }
 
-  // 3. Verify signature over canonical input
+  // 3. Verify signature over canonical input. The sorted query string is
+  // bound in so an intercepted signed GET can't have its params swapped
+  // (e.g. ?audio=hi -> ?audio=en) inside the 300s replay window.
   const bodyHash = await sha256Hex(bodyText);
-  const canonical = `${tsRaw}\n${method}\n${pathname}\n${bodyHash}\n${deviceId}`;
+  const sortedQuery = query
+    .split("&")
+    .filter(Boolean)
+    .sort()
+    .join("&");
+  const canonical = `${tsRaw}\n${method}\n${pathname}\n${sortedQuery}\n${bodyHash}\n${deviceId}`;
   const valid = await hmacSha256Verify(deviceSecret, canonical, signature);
   if (!valid) {
     return { ok: false, code: "BAD_SIGNATURE", error: "signature mismatch" };
@@ -119,10 +140,10 @@ export async function verifyHmacRequest(req: Request): Promise<HmacCheck> {
       bodyText = "";
     }
   }
-  return verifyHmacParts(req.method, url.pathname, (n) => req.headers.get(n), bodyText);
+  return verifyHmacParts(req.method, url.pathname, (n) => req.headers.get(n), bodyText, url.search.slice(1));
 }
 
-/** Revocation check for expensive endpoints (/v1/stream/*). */
+/** Revocation check — enforced on ALL authenticated routes for HMAC mode. */
 export async function isMemberRefRevoked(ref: string): Promise<boolean> {
   return isRevokedRaw(ref);
 }
