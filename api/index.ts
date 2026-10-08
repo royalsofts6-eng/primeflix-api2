@@ -18,7 +18,7 @@ import {
   revokePlain,
 } from "../src/security/plain.js";
 
-const VERSION = "1.1.0";
+const VERSION = "1.1.1";
 const CLUSTER = process.env.CLUSTER_NAME || "api1";
 const PUBLIC_PATHS = new Set(["/", "/health", "/api", "/api/health"]);
 
@@ -44,10 +44,21 @@ function privateCache(ttlMs: number): Record<string, string> {
   };
 }
 
-const num = (v: string | undefined, d: number): number => {
-  const n = parseInt(v || "", 10);
-  return Number.isFinite(n) && n > 0 ? n : d;
+/**
+ * Strict positive-int parse for season/episode path params (P1-1 fix
+ * 2026-10-08): the old num() silently defaulted garbage like "-3" to 1,
+ * so /v1/stream/tv/1396/1/-3 returned a REAL stream for S1E1. null means
+ * the route must 400 — never silently remap to a default.
+ */
+const posInt = (v: string | undefined): number | null => {
+  if (!v || !/^\d+$/.test(v)) return null;
+  const n = parseInt(v, 10);
+  return Number.isSafeInteger(n) && n >= 1 ? n : null;
 };
+
+// Sane upper bounds for season/episode (P1-1).
+const MAX_SEASON = 100;
+const MAX_EPISODE = 500;
 
 /** TMDB ids are numeric — reject anything else before it reaches upstream URLs. */
 const tmdbId = (v: string | undefined): string | null =>
@@ -195,7 +206,11 @@ export default async function handler(req: any, res: any) {
     if ((m = path.match(/^\/v1\/tmdb\/tv\/([^/]+)\/season\/([^/]+)$/))) {
       const id = tmdbId(m[1]);
       if (!id) return send(res, 400, fail("invalid tmdb id", "BAD_QUERY"));
-      const data = await tmdb.tvSeason(id, num(m[2], 1));
+      const season = posInt(m[2]);
+      if (season === null || season > MAX_SEASON) {
+        return send(res, 400, fail("invalid season (expected 1-100)", "BAD_QUERY"));
+      }
+      const data = await tmdb.tvSeason(id, season);
       return send(res, 200, ok(data), privateCache(TTL.details));
     }
     if ((m = path.match(/^\/v1\/tmdb\/tv\/([^/]+)\/recommendations$/))) {
@@ -231,7 +246,12 @@ export default async function handler(req: any, res: any) {
     if ((m = path.match(/^\/v1\/stream\/tv\/([^/]+)\/([^/]+)\/([^/]+)\/languages$/))) {
       const id = tmdbId(m[1]);
       if (!id) return send(res, 400, fail("invalid tmdb id", "BAD_QUERY"));
-      const info = await availableAudio(id, "tv", num(m[2], 1), num(m[3], 1));
+      const season = posInt(m[2]);
+      const episode = posInt(m[3]);
+      if (season === null || episode === null || season > MAX_SEASON || episode > MAX_EPISODE) {
+        return send(res, 400, fail("invalid season/episode (expected season 1-100, episode 1-500)", "BAD_QUERY"));
+      }
+      const info = await availableAudio(id, "tv", season, episode);
       return send(res, 200, ok({ audio: info.audio, original: info.original, playing: info.playing, labels: info.labels }), { "Cache-Control": "no-store" });
     }
 
@@ -246,7 +266,12 @@ export default async function handler(req: any, res: any) {
     if ((m = path.match(/^\/v1\/stream\/tv\/([^/]+)\/([^/]+)\/([^/]+)$/))) {
       const id = tmdbId(m[1]);
       if (!id) return send(res, 400, fail("invalid tmdb id", "BAD_QUERY"));
-      const data = await resolveStream(id, "tv", num(m[2], 1), num(m[3], 1), q.get("audio") || undefined);
+      const season = posInt(m[2]);
+      const episode = posInt(m[3]);
+      if (season === null || episode === null || season > MAX_SEASON || episode > MAX_EPISODE) {
+        return send(res, 400, fail("invalid season/episode (expected season 1-100, episode 1-500)", "BAD_QUERY"));
+      }
+      const data = await resolveStream(id, "tv", season, episode, q.get("audio") || undefined);
       return send(res, 200, ok(data), { "Cache-Control": "no-store" });
     }
 
