@@ -169,12 +169,13 @@ export default async function handler(req: any, res: any) {
     }
 
     // Stream resolution (NEVER cache — signed URLs expire)
+    // ?audio=hi → Hindi-dubbed only (VidZee); ?audio=en → English/original only.
     if ((m = path.match(/^\/v1\/stream\/movie\/([^/]+)$/))) {
-      const data = await resolveStream(m[1], "movie");
+      const data = await resolveStream(m[1], "movie", undefined, undefined, q.get("audio") || undefined);
       return send(res, 200, ok(data), { "Cache-Control": "no-store" });
     }
     if ((m = path.match(/^\/v1\/stream\/tv\/([^/]+)\/([^/]+)\/([^/]+)$/))) {
-      const data = await resolveStream(m[1], "tv", num(m[2], 1), num(m[3], 1));
+      const data = await resolveStream(m[1], "tv", num(m[2], 1), num(m[3], 1), q.get("audio") || undefined);
       return send(res, 200, ok(data), { "Cache-Control": "no-store" });
     }
 
@@ -214,7 +215,18 @@ export default async function handler(req: any, res: any) {
     return send(res, 404, fail("not found", "NOT_FOUND"));
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
-    const status = msg.includes("TMDB rate limited") ? 429 : msg.includes("all providers") ? 502 : 500;
-    return send(res, status, fail(msg, status === 429 ? "TMDB_RATE_LIMIT" : "UPSTREAM_ERROR"));
+    let code = "UPSTREAM_ERROR";
+    let status = 500;
+    if (msg.includes("hindi dubbed not available")) {
+      code = "HINDI_UNAVAILABLE";
+      status = 502;
+    } else if (msg.includes("TMDB rate limited")) {
+      code = "TMDB_RATE_LIMIT";
+      status = 429;
+    } else if (msg.includes("all providers")) {
+      code = "UPSTREAM_ERROR";
+      status = 502;
+    }
+    return send(res, status, fail(msg, code));
   }
 }

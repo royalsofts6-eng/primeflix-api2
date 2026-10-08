@@ -157,20 +157,39 @@ export interface ChainResult extends ProviderResult {
 /**
  * Resolve a stream. Races the top-3 healthiest providers in parallel,
  * returns the first success within the overall budget.
+ *
+ * @param audio "hi" = Hindi-dubbed only (VidZee; throws HINDI_UNAVAILABLE when
+ *   missing — no silent fallback so the app can show an honest message).
+ *   "en" = English/original only (skips VidZee). Omitted = Hindi-first
+ *   (Ali 2026-10-08): VidZee Hindi-dubbed before the English chain.
  */
 export async function resolveStream(
   tmdbId: string,
   type: "movie" | "tv",
   season?: number,
-  episode?: number
+  episode?: number,
+  audio?: string
 ): Promise<ChainResult> {
   const t0 = Date.now();
 
-  // Hindi-first (Ali 2026-10-08): try VidZee Hindi-dubbed before the English chain.
-  // VidZee has a short internal fetch timeout (3.5s) so the Vercel Hobby 10s
-  // budget stays safe; on miss we fall through to the normal chain.
+  // Explicit Hindi request (language switcher): VidZee only.
+  if (audio === "hi") {
+    const hindiEntry: ProviderEntry = { name: "vidzee", fn: vidzee };
+    if (!circuitOpen(hindiEntry.name)) {
+      const hindi = await tryProvider(hindiEntry, tmdbId, type, season, episode);
+      if (hindi) {
+        return { ...hindi, resolvedBy: hindiEntry.name, latencyMs: Date.now() - t0 };
+      }
+    }
+    throw new Error("hindi dubbed not available");
+  }
+
+  const skipHindi = audio === "en";
   const hindiEntry: ProviderEntry = { name: "vidzee", fn: vidzee };
-  if (!circuitOpen(hindiEntry.name)) {
+  if (!skipHindi && !circuitOpen(hindiEntry.name)) {
+    // Hindi-first (Ali 2026-10-08): try VidZee Hindi-dubbed before the English chain.
+    // VidZee has a short internal fetch timeout (3.5s) so the Vercel Hobby 10s
+    // budget stays safe; on miss we fall through to the normal chain.
     const hindi = await tryProvider(hindiEntry, tmdbId, type, season, episode);
     if (hindi) {
       return { ...hindi, resolvedBy: hindiEntry.name, latencyMs: Date.now() - t0 };
