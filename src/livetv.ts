@@ -363,18 +363,24 @@ async function fetchText(url: string, timeoutMs = 15000): Promise<string | null>
   }
 }
 
-/** HEAD-probe a stream URL. Returns true if it looks alive. */
-async function probeUrl(url: string, timeoutMs = 5000): Promise<boolean> {
+/**
+ * Probe a stream URL. Returns true if it looks alive.
+ * Uses GET with a Range header instead of HEAD — many HLS servers
+ * mishandle HEAD (405/hang), which caused false "dead" markings.
+ */
+async function probeUrl(url: string, timeoutMs = 8000): Promise<boolean> {
   if (!url || !url.startsWith("http")) return false;
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const res = await fetch(url, {
-      method: "HEAD",
+      method: "GET",
       signal: ctrl.signal,
-      headers: { "User-Agent": "PrimeFlix/1.0" },
+      headers: { "User-Agent": "PrimeFlix/1.0", Range: "bytes=0-1023" },
       redirect: "follow",
     });
+    // Abort immediately — headers (200/206) are all we need.
+    ctrl.abort();
     return res.ok;
   } catch {
     return false;
@@ -473,6 +479,29 @@ export async function refreshChannels(): Promise<RefreshResult> {
     alive,
     channels,
   };
+
+  // Anti-downgrade guard: a flaky probe run must not nuke the channel list.
+  // If this refresh found fewer working channels than the previous cache,
+  // restore previously-working URLs so one bad run can't hide channels.
+  const prevEntry = cacheGet<RefreshResult>(CACHE_KEY);
+  const prev = prevEntry?.value;
+  if (prev && result.alive < prev.alive) {
+    const prevByName = new Map(prev.channels.map((c) => [norm(c.name), c]));
+    result.channels = result.channels.map((ch) => {
+      const p = prevByName.get(norm(ch.name));
+      if (p && p.url && !ch.url) {
+        const merged = [...ch.fallbacks];
+        for (const f of [p.url, ...p.fallbacks]) {
+          if (!merged.includes(f) && merged.length < 4) merged.push(f);
+        }
+        return { ...ch, url: p.url, fallbacks: merged.slice(1) };
+      }
+      return ch;
+    });
+    result.alive = result.channels.filter(
+      (c) => c.url || c.type === "youtube",
+    ).length;
+  }
 
   cacheSet(CACHE_KEY, result, TTL_MS, STALE_MS);
   return result;
