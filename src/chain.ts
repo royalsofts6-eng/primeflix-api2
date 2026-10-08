@@ -16,6 +16,7 @@
  */
 import { vidlink } from "./providers/vidlink.js";
 import { vaplayer } from "./providers/vaplayer.js";
+import { vidzee } from "./providers/vidzee.js";
 import { tmdb } from "./tmdb.js";
 import type { ProviderFn, ProviderResult } from "./providers/types.js";
 
@@ -164,6 +165,18 @@ export async function resolveStream(
   episode?: number
 ): Promise<ChainResult> {
   const t0 = Date.now();
+
+  // Hindi-first (Ali 2026-10-08): try VidZee Hindi-dubbed before the English chain.
+  // VidZee has a short internal fetch timeout (3.5s) so the Vercel Hobby 10s
+  // budget stays safe; on miss we fall through to the normal chain.
+  const hindiEntry: ProviderEntry = { name: "vidzee", fn: vidzee };
+  if (!circuitOpen(hindiEntry.name)) {
+    const hindi = await tryProvider(hindiEntry, tmdbId, type, season, episode);
+    if (hindi) {
+      return { ...hindi, resolvedBy: hindiEntry.name, latencyMs: Date.now() - t0 };
+    }
+  }
+
   const ranked = rankProviders();
   if (ranked.length === 0) throw new Error("all providers in cooldown");
 
