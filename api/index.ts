@@ -103,6 +103,8 @@ export default async function handler(req: any, res: any) {
           "GET /health",
           "GET /v1/tmdb/trending/movie?time_window=day",
           "GET /v1/tmdb/trending/tv?time_window=day",
+          "GET /v1/tmdb/discover/movie?with_genres=&with_original_language=&with_origin_country=&sort_by=&page=&region=",
+          "GET /v1/tmdb/movie/upcoming?region=&page=",
           "GET /v1/tmdb/movie/:id",
           "GET /v1/tmdb/tv/:id",
           "GET /v1/tmdb/tv/:id/season/:season",
@@ -141,6 +143,27 @@ export default async function handler(req: any, res: any) {
     if (path === "/v1/tmdb/trending/tv") {
       const data = await tmdb.trendingTv(q.get("time_window") || "day");
       return send(res, 200, ok(data), edgeCache(TTL.trending, TTL.stale7d));
+    }
+    if (path === "/v1/tmdb/discover/movie") {
+      // Allowlisted params only (Ali 2026-10-08: Home rails — Hollywood, Bollywood,
+      // South Indian, Comedy, Adventure, Horror).
+      const allow = [
+        "with_genres", "with_original_language", "with_origin_country", "sort_by",
+        "page", "region", "vote_count.gte", "primary_release_date.gte",
+        "primary_release_date.lte", "with_release_type",
+      ];
+      const params: Record<string, string> = {};
+      for (const k of allow) {
+        const v = q.get(k);
+        if (v) params[k] = v;
+      }
+      const data = await tmdb.discoverMovie(params);
+      return send(res, 200, ok(data), edgeCache(TTL.discover, TTL.stale7d));
+    }
+    if (path === "/v1/tmdb/movie/upcoming") {
+      // Must sit BEFORE the /v1/tmdb/movie/:id regex below.
+      const data = await tmdb.upcomingMovies(q.get("region") || "US", q.get("page") || "1");
+      return send(res, 200, ok(data), edgeCache(TTL.discover, TTL.stale7d));
     }
     if ((m = path.match(/^\/v1\/tmdb\/movie\/([^/]+)$/))) {
       const data = await tmdb.movie(m[1]);

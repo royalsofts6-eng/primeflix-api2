@@ -89,6 +89,24 @@ export const tmdb = {
     tmdbGet(`/tv/${id}/recommendations`, { language: "en-US", page: "1" }, {
       cacheKey: `tmdb:tv:${id}:recs`, ttlMs: 24 * H, staleMs: 7 * D,
     }),
+  /**
+   * Discover movies by genre/language/country (Ali 2026-10-08: new Home rails —
+   * Hollywood, Bollywood, South Indian, Comedy, Adventure, Horror).
+   * Params are allowlisted at the route level; cache key is sorted for stability.
+   */
+  discoverMovie: (params: Record<string, string>) => {
+    const sorted = Object.keys(params).sort().map((k) => `${k}=${params[k]}`).join("&");
+    return tmdbGet(
+      "/discover/movie",
+      { language: "en-US", include_adult: "false", sort_by: "popularity.desc", ...params },
+      { cacheKey: `tmdb:discover:${sorted}`, ttlMs: 12 * H, staleMs: 7 * D }
+    );
+  },
+  /** Upcoming theatrical releases (Ali 2026-10-08: "Upcoming" home rail). */
+  upcomingMovies: (region = "US", page = "1") =>
+    tmdbGet("/movie/upcoming", { language: "en-US", region, page }, {
+      cacheKey: `tmdb:upcoming:${region}:${page}`, ttlMs: 12 * H, staleMs: 7 * D,
+    }),
 };
 
 /** Edge cache headers matching the TTLs above (seconds). */
@@ -98,4 +116,4 @@ export function edgeCacheHeaders(ttlMs: number, staleMs: number): Record<string,
   };
 }
 
-export const TTL = { trending: 6 * H, details: 24 * H, search: 1 * H, stale7d: 7 * D, stale1d: 1 * D };
+export const TTL = { trending: 6 * H, details: 24 * H, search: 1 * H, discover: 12 * H, stale7d: 7 * D, stale1d: 1 * D };
