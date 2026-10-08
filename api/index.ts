@@ -195,15 +195,17 @@ export default async function handler(req: any, res: any) {
     }
 
     // Available audio languages (Ali 2026-10-08: dub button shows ONLY what
-    // actually exists — VidZee/FZMovies Hindi check + always English).
+    // actually exists — TMDB original_language + VidZee/FZMovies Hindi check.
+    // Returns { audio, original, playing, labels }; `audio` stays top-level
+    // for backward compat with older apps.
     // MUST sit before the /v1/stream/movie/:tmdbId regex below.
     if ((m = path.match(/^\/v1\/stream\/movie\/([^/]+)\/languages$/))) {
-      const audio = await availableAudio(m[1], "movie");
-      return send(res, 200, ok({ audio }), { "Cache-Control": "no-store" });
+      const info = await availableAudio(m[1], "movie");
+      return send(res, 200, ok({ audio: info.audio, original: info.original, playing: info.playing, labels: info.labels }), { "Cache-Control": "no-store" });
     }
     if ((m = path.match(/^\/v1\/stream\/tv\/([^/]+)\/([^/]+)\/([^/]+)\/languages$/))) {
-      const audio = await availableAudio(m[1], "tv", num(m[2], 1), num(m[3], 1));
-      return send(res, 200, ok({ audio }), { "Cache-Control": "no-store" });
+      const info = await availableAudio(m[1], "tv", num(m[2], 1), num(m[3], 1));
+      return send(res, 200, ok({ audio: info.audio, original: info.original, playing: info.playing, labels: info.labels }), { "Cache-Control": "no-store" });
     }
 
     // Stream resolution (NEVER cache — signed URLs expire)

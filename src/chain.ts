@@ -164,7 +164,8 @@ export interface ChainResult extends ProviderResult {
  * 35-60s (Vercel Hobby = 10s), so the request path only reads its cache;
  * misses trigger a best-effort background warm for next time.
  *
- * @param audio "hi" = Hindi-dubbed only (VidZee → FZMovies cache; throws
+ * @param audio "hi" = Hindi (VidZee → FZMovies cache → VidLink when the
+ *   original language itself is Hindi, e.g. Bollywood titles; throws
  *   HINDI_UNAVAILABLE when missing — no silent fallback so the app can show
  *   an honest message).
  *   "en" = English/original only (skips Hindi tiers). Omitted = Hindi-first:
@@ -193,6 +194,15 @@ export async function resolveStream(
     const fz = await tryProvider(fzEntry, tmdbId, type, season, episode);
     if (fz) {
       return { ...fz, resolvedBy: fzEntry.name, latencyMs: Date.now() - t0 };
+    }
+    // Bollywood/Hindi-original titles: VidLink serves the Hindi ORIGINAL, so
+    // ?audio=hi is satisfiable even with no dubbed copy (Ali 2026-10-08:
+    // Drishyam showed "English" — the original IS Hindi).
+    if ((await originalLanguage(tmdbId, type)) === "hi") {
+      const vl = await tryProvider({ name: "vidlink", fn: vidlink }, tmdbId, type, season, episode);
+      if (vl) {
+        return { ...vl, resolvedBy: "vidlink", latencyMs: Date.now() - t0 };
+      }
     }
     // Miss: warm in background for next time, honest error now.
     void warmFZMovies(tmdbId, type).catch(() => {});
@@ -251,59 +261,120 @@ export async function resolveStream(
 }
 
 /**
+ * Display names for ISO 639-1 language codes (Ali 2026-10-08: dub button must
+ * show the movie's REAL original language, e.g. Hindi for Bollywood titles —
+ * not a hardcoded "English").
+ */
+export const LANG_LABELS: Record<string, string> = {
+  hi: "Hindi", en: "English", ur: "Urdu", pa: "Punjabi",
+  te: "Telugu", ta: "Tamil", ml: "Malayalam", kn: "Kannada",
+  bn: "Bengali", mr: "Marathi", gu: "Gujarati",
+  ko: "Korean", ja: "Japanese", zh: "Chinese",
+  es: "Spanish", fr: "French", de: "German", it: "Italian",
+  pt: "Portuguese", ru: "Russian", ar: "Arabic", fa: "Persian",
+  tr: "Turkish", id: "Indonesian", ms: "Malay", th: "Thai", vi: "Vietnamese",
+};
+
+/** TMDB original_language for a title (cached 24h by tmdb.movie/tv). */
+export async function originalLanguage(
+  tmdbId: string,
+  type: "movie" | "tv"
+): Promise<string> {
+  try {
+    const details = (await (type === "movie" ? tmdb.movie(tmdbId) : tmdb.tv(tmdbId))) as any;
+    const code = details?.original_language;
+    return typeof code === "string" && code.length >= 2 ? code : "en";
+  } catch {
+    return "en";
+  }
+}
+
+export interface AudioInfo {
+  /** TMDB original_language, e.g. "hi" for Drishyam, "en" for Avengers. */
+  original: string;
+  /** Available audio codes, Hindi-first. The original language is ALWAYS
+   *  included (VidLink serves the original track). */
+  audio: string[];
+  /** Code of the track that plays by default ("hi" when Hindi is available). */
+  playing: string;
+  /** Display names for every code in `audio`. */
+  labels: Record<string, string>;
+}
+
+function labelFor(code: string): string {
+  return LANG_LABELS[code] || code.toUpperCase();
+}
+
+/**
  * Available audio languages for a title (Ali 2026-10-08: dub button must show
- * ONLY languages that are actually available, not a hardcoded list).
+ * ONLY languages that are actually available, not a hardcoded list — AND it
+ * must show the movie's REAL original language, e.g. Hindi for Bollywood).
  *
- * - "en": always available (VidLink English chain).
- * - "hi": available if VidZee has Hindi-dubbed (fast check, 3.5s internal
- *   timeout) OR the FZMovies cache has it (instant memory lookup).
+ * - The original language is ALWAYS available (VidLink serves the original).
+ * - "hi" is added when the original is not Hindi AND VidZee has Hindi-dubbed
+ *   (fast check, 3.5s internal timeout) OR the FZMovies cache has it (instant
+ *   memory lookup).
+ * - When the original IS Hindi (e.g. Drishyam), "hi" covers both the original
+ *   and any dub — no duplicate entry, no fake "English".
  *
  * Budget: ~4s max — fits the Vercel Hobby 10s window with room to spare.
- * Returns e.g. ["hi", "en"] or ["en"].
+ * Returns e.g. { original: "hi", audio: ["hi"], playing: "hi" } for Drishyam,
+ * or { original: "en", audio: ["hi", "en"], playing: "hi" } for Avengers.
  */
 export async function availableAudio(
   tmdbId: string,
   type: "movie" | "tv",
   season?: number,
   episode?: number
-): Promise<string[]> {
-  const langs = ["en"]; // English/original always available via VidLink
+): Promise<AudioInfo> {
+  const original = await originalLanguage(tmdbId, type);
 
-  const hindiEntry: ProviderEntry = { name: "vidzee", fn: vidzee };
-  const fzEntry: ProviderEntry = { name: "fzmovies", fn: fzmovies };
+  // Hindi-dub check only matters when the original is not already Hindi.
+  let hindiDub = original === "hi";
+  if (!hindiDub) {
+    const hindiEntry: ProviderEntry = { name: "vidzee", fn: vidzee };
+    const fzEntry: ProviderEntry = { name: "fzmovies", fn: fzmovies };
 
-  // Parallel: VidZee live check + FZMovies cache check. Either hit = Hindi.
-  const checks: Promise<boolean>[] = [];
-  if (!circuitOpen(hindiEntry.name)) {
+    // Parallel: VidZee live check + FZMovies cache check. Either hit = Hindi.
+    const checks: Promise<boolean>[] = [];
+    if (!circuitOpen(hindiEntry.name)) {
+      checks.push(
+        (async () => {
+          try {
+            const r = await vidzee(tmdbId, type, season, episode);
+            return !!(r && r.qualities.length > 0);
+          } catch {
+            return false;
+          }
+        })()
+      );
+    }
+    // FZMovies cache-only check is instant and never throws meaningfully.
     checks.push(
       (async () => {
         try {
-          const r = await vidzee(tmdbId, type, season, episode);
+          const r = await fzmovies(tmdbId, type);
           return !!(r && r.qualities.length > 0);
         } catch {
           return false;
         }
       })()
     );
-  }
-  // FZMovies cache-only check is instant and never throws meaningfully.
-  checks.push(
-    (async () => {
-      try {
-        const r = await fzmovies(tmdbId, type);
-        return !!(r && r.qualities.length > 0);
-      } catch {
-        return false;
-      }
-    })()
-  );
 
-  const results = await Promise.race([
-    Promise.all(checks),
-    new Promise<boolean[]>((res) => setTimeout(() => res([false]), 5000)),
-  ]);
-  if (results.some(Boolean)) {
-    return ["hi", "en"];
+    const results = await Promise.race([
+      Promise.all(checks),
+      new Promise<boolean[]>((res) => setTimeout(() => res([false]), 5000)),
+    ]);
+    hindiDub = results.some(Boolean);
   }
-  return langs;
+
+  // Hindi-first (Ali's standing rule), then the original. Deduped.
+  const audio: string[] = [];
+  if (hindiDub && !audio.includes("hi")) audio.push("hi");
+  if (!audio.includes(original)) audio.push(original);
+
+  const labels: Record<string, string> = {};
+  for (const code of audio) labels[code] = labelFor(code);
+
+  return { original, audio, playing: hindiDub ? "hi" : original, labels };
 }
