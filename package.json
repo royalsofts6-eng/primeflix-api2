@@ -1,0 +1,18 @@
+{
+  "dependencies": {
+    "tweetnacl": "^1.0.3"
+  },
+  "description": "PrimeFlix API Cluster 2 \u2014 TMDB proxy + multi-provider streaming",
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  },
+  "main": "src/index.ts",
+  "name": "primeflix-api2",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "type": "module",
+  "version": "1.0.0"
+}
