@@ -13,6 +13,12 @@
  *    (POST /v1/auth/revoke with admin key). Checked on /v1/stream/*.
  */
 import { sha256Hex, hmacSha256Hex } from "./crypto.js";
+import {
+  redisEnabled,
+  redisDeviceRegister,
+  redisRevokeRef,
+  redisIsRefRevoked,
+} from "./redis.js";
 
 function envList(name: string): Set<string> {
   const raw = process.env[name] || "";
@@ -36,14 +42,28 @@ export function isMemberKeyValid(memberKey: string): boolean {
   return keys.has(memberKey.trim());
 }
 
-export function isRevoked(memberKey: string): boolean {
+export async function isRevoked(memberKey: string): Promise<boolean> {
   if (inMemoryBlocklist.has(memberKey.trim())) return true;
-  return envList("REVOKED_KEYS").has(memberKey.trim());
+  if (envList("REVOKED_KEYS").has(memberKey.trim())) return true;
+  // Redis revocation set (key IDs only) — checked by memberRef.
+  if (redisEnabled()) {
+    const ref = await memberRef(memberKey.trim());
+    const hit = await redisIsRefRevoked(ref);
+    if (hit === true) return true;
+  }
+  return false;
 }
 
 const inMemoryBlocklist = new Set<string>();
 export function revokeMemberKey(memberKey: string): void {
   inMemoryBlocklist.add(memberKey.trim());
+  // Fan out to Redis so ALL instances (api1 + api2) honor it immediately.
+  // Fire-and-forget: local blocklist already covers this instance.
+  if (redisEnabled()) {
+    memberRef(memberKey.trim())
+      .then((ref) => redisRevokeRef(ref))
+      .catch(() => {});
+  }
 }
 /** Check revocation by memberRef (hash) — for use with JWT claims. */
 export async function isRevokedRaw(ref: string): Promise<boolean> {
@@ -52,6 +72,10 @@ export async function isRevokedRaw(ref: string): Promise<boolean> {
   }
   for (const k of envList("REVOKED_KEYS")) {
     if ((await memberRef(k)).slice(0, 32) === ref) return true;
+  }
+  if (redisEnabled()) {
+    const hit = await redisIsRefRevoked(ref);
+    if (hit === true) return true;
   }
   return false;
 }
@@ -79,6 +103,13 @@ export async function registerDevice(
     return { ok: false, reason: "bad device id" };
   }
   const ref = await memberRef(memberKey);
+  // Redis atomic check-and-add (shared across api1/api2) — preferred path.
+  if (redisEnabled()) {
+    const r = await redisDeviceRegister(ref, deviceId, MAX_DEVICES);
+    if (r === "limit") return { ok: false, reason: "device limit reached (2 max)" };
+    if (r === "added" || r === "exists") return { ok: true };
+    // null = Redis failed → fall through to in-memory registry.
+  }
   let set = registry.get(ref);
   if (!set) {
     set = new Set();

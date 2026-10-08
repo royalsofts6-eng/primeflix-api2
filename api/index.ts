@@ -9,6 +9,7 @@ import { cacheStats } from "../src/cache.js";
 import { getSeries, getSeasons, getEpisodesForSerie, getStreamUrl, NIAZI_TTL } from "../src/niazitv.js";
 import { getChannels, refreshChannels, groupByCategory, hideDead, pendingChannels } from "../src/livetv.js";
 import { securityStats } from "../src/security/stats.js";
+import { redisHealth } from "../src/security/redis.js";
 import {
   authGatePlain,
   nodeHeaderGetter,
@@ -179,7 +180,7 @@ export default async function handler(req: any, res: any) {
         ok: true, cluster: CLUSTER, version: VERSION,
         tmdbKeyConfigured: !!process.env.TMDB_API_KEY,
         providers: providerHealth(), cache: cacheStats(), fzmovies: fzStats(),
-        security: securityStats(),
+        security: securityStats(), redis: await redisHealth(),
       });
     }
 

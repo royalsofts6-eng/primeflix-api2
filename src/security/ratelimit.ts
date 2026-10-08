@@ -8,9 +8,11 @@
  *   /v1/auth/*   :  10 req/min per IP (brute-force protection)
  *   default      :  60 req/min per member
  *
- * NOTE: in-memory per instance (serverless). Strict cross-instance
- * enforcement needs shared Redis (Phase 2). Best-effort for now.
+ * NOTE: in-memory per instance (serverless). Redis-backed fixed-window
+ * counters are tried FIRST (shared across api1/api2); the in-memory bucket
+ * is the fallback when Redis is unavailable (degrades to best-effort).
  */
+import { redisEnabled, redisFixedWindow } from "./redis.js";
 
 interface Bucket {
   tokens: number;
@@ -60,23 +62,40 @@ export interface RateLimit {
   retryAfterSec?: number;
 }
 
-export function checkRateLimit(pathname: string, identity: string): RateLimit {
-  maybeCleanup();
+export async function checkRateLimit(pathname: string, identity: string): Promise<RateLimit> {
   let capacity: number;
   let perMin: number;
+  let cls: string;
   if (pathname.startsWith("/v1/stream/")) {
     capacity = 60;
     perMin = 60;
+    cls = "stream";
   } else if (pathname.startsWith("/v1/tmdb/")) {
     capacity = 100;
     perMin = 100;
+    cls = "tmdb";
   } else if (pathname.startsWith("/v1/auth/")) {
     capacity = 10;
     perMin = 10;
+    cls = "auth";
   } else {
     capacity = 60;
     perMin = 60;
+    cls = "default";
   }
+  // Redis fixed-window (shared across instances) — preferred path.
+  if (redisEnabled()) {
+    const window = Math.floor(Date.now() / 60_000);
+    const key = `pf:rl:${cls}:${identity}:${window}`;
+    const allowed = await redisFixedWindow(key, capacity, 120);
+    if (allowed === true) return { allowed: true };
+    if (allowed === false) {
+      return { allowed: false, retryAfterSec: Math.ceil(60 / perMin) };
+    }
+    // null = Redis failed → fall through to in-memory bucket.
+  }
+  // In-memory token bucket (per-instance fallback).
+  maybeCleanup();
   const key = `${pathname.split("/").slice(0, 4).join("/")}:${identity}`;
   const ok = bucketFor(key, capacity, perMin / 60);
   if (!ok) {

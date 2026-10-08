@@ -72,7 +72,7 @@ export async function authGatePlain(
   const apiKey = process.env.API_KEY;
   const gotKey = header("X-API-Key");
   if (apiKey && gotKey === apiKey) {
-    const rl = checkRateLimit(pathname, "apikey");
+    const rl = await checkRateLimit(pathname, "apikey");
     if (!rl.allowed)
       return { ok: false, status: 429, code: "RATE_LIMITED", error: "rate limited", retryAfter: rl.retryAfterSec };
     return { ok: true, mode: "apikey" };
@@ -89,7 +89,7 @@ export async function authGatePlain(
   if (check.memberRef && (await isMemberRefRevoked(check.memberRef))) {
     return { ok: false, status: 403, code: "REVOKED", error: "member key revoked" };
   }
-  const rl = checkRateLimit(pathname, check.memberRef || "unknown");
+  const rl = await checkRateLimit(pathname, check.memberRef || "unknown");
   if (!rl.allowed) {
     return { ok: false, status: 429, code: "RATE_LIMITED", error: "rate limited", retryAfter: rl.retryAfterSec };
   }
@@ -98,7 +98,7 @@ export async function authGatePlain(
 
 /** POST /v1/auth/register */
 export async function registerPlain(bodyText: string, clientIp: string): Promise<{ status: number; json: unknown }> {
-  const rl = checkRateLimit("/v1/auth/register", `ip:${clientIp}`);
+  const rl = await checkRateLimit("/v1/auth/register", `ip:${clientIp}`);
   if (!rl.allowed)
     return { status: 429, json: { success: false, error: "rate limited", code: "RATE_LIMITED" } };
   let body: { memberKey?: string; deviceId?: string };
@@ -112,7 +112,7 @@ export async function registerPlain(bodyText: string, clientIp: string): Promise
   if (!isMemberKeyValid(memberKey)) {
     return { status: 401, json: { success: false, error: "invalid member key", code: "BAD_MEMBER_KEY" } };
   }
-  if (isRevoked(memberKey)) {
+  if (await isRevoked(memberKey)) {
     return { status: 403, json: { success: false, error: "member key revoked", code: "REVOKED" } };
   }
   const reg = await registerDevice(memberKey, deviceId);
@@ -131,7 +131,7 @@ export async function registerPlain(bodyText: string, clientIp: string): Promise
 /** POST /v1/auth/refresh — rate-limited by IP (a stolen token must not be
  *  refreshable at machine speed; refresh also re-checks revocation). */
 export async function refreshPlain(bodyText: string, clientIp: string): Promise<{ status: number; json: unknown }> {
-  const rl = checkRateLimit("/v1/auth/refresh", `ip:${clientIp}`);
+  const rl = await checkRateLimit("/v1/auth/refresh", `ip:${clientIp}`);
   if (!rl.allowed)
     return { status: 429, json: { success: false, error: "rate limited", code: "RATE_LIMITED" } };
   let body: { token?: string };

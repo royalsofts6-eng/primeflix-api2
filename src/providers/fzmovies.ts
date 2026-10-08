@@ -29,6 +29,7 @@
  */
 import { cacheGet, cacheSet } from "../cache.js";
 import { tmdb } from "../tmdb.js";
+import { redisEnabled, redisCacheGet, redisCacheSet } from "../security/redis.js";
 import type { ProviderFn, ProviderResult, StreamQuality } from "./types.js";
 
 const FZ_BASE = (process.env.FZ_BASE_URL || "https://www.fzmovies.host").replace(/\/$/, "");
@@ -357,6 +358,15 @@ const cacheKey = (tmdbId: string) => `fz:hi:${tmdbId}`;
 export const fzmovies: ProviderFn = async (tmdbId, type) => {
   if (type !== "movie") return null;
   if (circuitOpen()) return null;
+  // Redis shared cache FIRST (api1 + api2 see the same warmed entries),
+  // then per-instance memory. Cache-ONLY — never blocks, never scrapes.
+  if (redisEnabled()) {
+    const rhit = await redisCacheGet<ProviderResult>(cacheKey(tmdbId));
+    if (rhit) {
+      cacheSet(cacheKey(tmdbId), rhit, CACHE_TTL_MS, 0); // backfill local
+      return rhit;
+    }
+  }
   const hit = cacheGet<ProviderResult>(cacheKey(tmdbId));
   if (!hit) return null;
   return hit.value;
@@ -404,6 +414,10 @@ export async function warmFZMovies(
         );
         if (r && r.qualities.length > 0) {
           cacheSet(key, r, CACHE_TTL_MS, 0);
+          // Fan out to Redis so BOTH clusters (api1 + api2) serve it.
+          if (redisEnabled()) {
+            await redisCacheSet(key, r, Math.floor(CACHE_TTL_MS / 1000));
+          }
           return { warmed: true, reason: "warmed", qualities: r.qualities.length };
         }
         return { warmed: false, reason: "failed" };
