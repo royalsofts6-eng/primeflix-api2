@@ -228,6 +228,9 @@ export default async function handler(req: any, res: any) {
     if (path === "/v1/tmdb/search/multi") {
       const query = q.get("query") || "";
       if (query.length < 2) return send(res, 400, fail("query too short", "BAD_QUERY"));
+      // P1-2 (2026-10-08): a 10KB query made TMDB return 414, which we then
+      // mapped to 500. Cap server-side — never proxy garbage upstream.
+      if (query.length > 200) return send(res, 400, fail("query too long (max 200 chars)", "BAD_QUERY"));
       const data = await tmdb.search(query, q.get("page") || "1");
       return send(res, 200, ok(data), privateCache(TTL.search));
     }
@@ -360,6 +363,13 @@ export default async function handler(req: any, res: any) {
     } else if (msg.includes("all providers")) {
       code = "UPSTREAM_ERROR";
       status = 502;
+    } else if (/^TMDB HTTP \d+$/.test(msg)) {
+      // P1-2 (2026-10-08): upstream TMDB errors are never OUR 500.
+      // 4xx passes through as-is (400/404/...); 5xx becomes 502
+      // (upstream failed, not us).
+      const upstream = parseInt(msg.slice("TMDB HTTP ".length), 10);
+      code = "UPSTREAM_ERROR";
+      status = upstream >= 400 && upstream < 500 ? upstream : 502;
     }
     return send(res, status, fail(msg, code));
   }
