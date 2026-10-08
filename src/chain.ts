@@ -17,6 +17,7 @@
 import { vidlink } from "./providers/vidlink.js";
 import { vaplayer } from "./providers/vaplayer.js";
 import { vidzee } from "./providers/vidzee.js";
+import { fzmovies, warmFZMovies } from "./providers/fzmovies.js";
 import { tmdb } from "./tmdb.js";
 import type { ProviderFn, ProviderResult } from "./providers/types.js";
 
@@ -158,10 +159,16 @@ export interface ChainResult extends ProviderResult {
  * Resolve a stream. Races the top-3 healthiest providers in parallel,
  * returns the first success within the overall budget.
  *
- * @param audio "hi" = Hindi-dubbed only (VidZee; throws HINDI_UNAVAILABLE when
- *   missing — no silent fallback so the app can show an honest message).
- *   "en" = English/original only (skips VidZee). Omitted = Hindi-first
- *   (Ali 2026-10-08): VidZee Hindi-dubbed before the English chain.
+ * Hindi chain (Ali 2026-10-08): VidZee → FZMovies → (VidLink English).
+ * FZMovies is a PROPER Hindi tier, not a backup. Its 4-hop scrape takes
+ * 35-60s (Vercel Hobby = 10s), so the request path only reads its cache;
+ * misses trigger a best-effort background warm for next time.
+ *
+ * @param audio "hi" = Hindi-dubbed only (VidZee → FZMovies cache; throws
+ *   HINDI_UNAVAILABLE when missing — no silent fallback so the app can show
+ *   an honest message).
+ *   "en" = English/original only (skips Hindi tiers). Omitted = Hindi-first:
+ *   VidZee → FZMovies cache → English race chain.
  */
 export async function resolveStream(
   tmdbId: string,
@@ -172,7 +179,7 @@ export async function resolveStream(
 ): Promise<ChainResult> {
   const t0 = Date.now();
 
-  // Explicit Hindi request (language switcher): VidZee only.
+  // Explicit Hindi request (language switcher): VidZee → FZMovies cache.
   if (audio === "hi") {
     const hindiEntry: ProviderEntry = { name: "vidzee", fn: vidzee };
     if (!circuitOpen(hindiEntry.name)) {
@@ -181,6 +188,14 @@ export async function resolveStream(
         return { ...hindi, resolvedBy: hindiEntry.name, latencyMs: Date.now() - t0 };
       }
     }
+    // FZMovies Hindi tier (cache-only in request path — never blocks).
+    const fzEntry: ProviderEntry = { name: "fzmovies", fn: fzmovies };
+    const fz = await tryProvider(fzEntry, tmdbId, type, season, episode);
+    if (fz) {
+      return { ...fz, resolvedBy: fzEntry.name, latencyMs: Date.now() - t0 };
+    }
+    // Miss: warm in background for next time, honest error now.
+    void warmFZMovies(tmdbId, type).catch(() => {});
     throw new Error("hindi dubbed not available");
   }
 
@@ -189,11 +204,19 @@ export async function resolveStream(
   if (!skipHindi && !circuitOpen(hindiEntry.name)) {
     // Hindi-first (Ali 2026-10-08): try VidZee Hindi-dubbed before the English chain.
     // VidZee has a short internal fetch timeout (3.5s) so the Vercel Hobby 10s
-    // budget stays safe; on miss we fall through to the normal chain.
+    // budget stays safe; on miss we fall through to FZMovies cache, then chain.
     const hindi = await tryProvider(hindiEntry, tmdbId, type, season, episode);
     if (hindi) {
       return { ...hindi, resolvedBy: hindiEntry.name, latencyMs: Date.now() - t0 };
     }
+    // FZMovies Hindi tier (cache-only — instant).
+    const fzEntry: ProviderEntry = { name: "fzmovies", fn: fzmovies };
+    const fz = await tryProvider(fzEntry, tmdbId, type, season, episode);
+    if (fz) {
+      return { ...fz, resolvedBy: fzEntry.name, latencyMs: Date.now() - t0 };
+    }
+    // Cache miss: warm in background while the English chain serves now.
+    void warmFZMovies(tmdbId, type).catch(() => {});
   }
 
   const ranked = rankProviders();

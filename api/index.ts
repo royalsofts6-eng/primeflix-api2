@@ -4,6 +4,7 @@
  */
 import { tmdb, TTL } from "../src/tmdb.js";
 import { resolveStream, providerHealth } from "../src/chain.js";
+import { fzmovies, warmFZMovies, fzStats } from "../src/providers/fzmovies.js";
 import { cacheStats } from "../src/cache.js";
 import { getSeries, getEpisodes, getStreamUrl, NIAZI_TTL } from "../src/niazitv.js";
 import { getChannels, refreshChannels, groupByCategory } from "../src/livetv.js";
@@ -126,7 +127,7 @@ export default async function handler(req: any, res: any) {
       return send(res, 200, {
         ok: true, cluster: CLUSTER, version: VERSION,
         tmdbKeyConfigured: !!process.env.TMDB_API_KEY,
-        providers: providerHealth(), cache: cacheStats(),
+        providers: providerHealth(), cache: cacheStats(), fzmovies: fzStats(),
         security: securityStats(),
       });
     }
@@ -210,6 +211,21 @@ export default async function handler(req: any, res: any) {
       }
       const data = await refreshChannels();
       return send(res, 200, ok({ refreshedAt: data.refreshedAt, total: data.total, alive: data.alive }));
+    }
+    // FZMovies cache warmer (CRON_SECRET protected). The 4-hop FZMovies scrape
+    // takes 35-60s — too slow for the 10s request path — so popular Hindi
+    // titles are pre-resolved here and served from cache (10h TTL).
+    // Usage: GET /v1/cron/fz-warm?tmdbId=299536&secret=...
+    if (path === "/v1/cron/fz-warm") {
+      const secret = q.get("secret") || header("x-cron-secret");
+      if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+        return send(res, 401, fail("unauthorized", "BAD_CRON_SECRET"));
+      }
+      const tmdbId = q.get("tmdbId") || "";
+      if (!tmdbId) return send(res, 400, fail("tmdbId required", "BAD_QUERY"));
+      await warmFZMovies(tmdbId, "movie");
+      const hit = await fzmovies(tmdbId, "movie");
+      return send(res, 200, ok({ tmdbId, warmed: !!hit, qualities: hit?.qualities?.length || 0 }));
     }
 
     return send(res, 404, fail("not found", "NOT_FOUND"));
