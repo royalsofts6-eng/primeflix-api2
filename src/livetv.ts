@@ -21,7 +21,7 @@ export interface Channel {
   id: string;
   name: string;
   category: ChannelCategory;
-  country: "pk" | "in";
+  country: "pk" | "in" | "int";
   type: "hls" | "youtube";
   url: string;
   fallbacks: string[];
@@ -30,21 +30,25 @@ export interface Channel {
 
 export type ChannelCategory =
   | "pk-entertainment"
+  | "pk-movies"
   | "pk-sports"
   | "pk-news"
   | "in-entertainment"
   | "in-movies"
   | "sports"
-  | "in-news";
+  | "in-news"
+  | "islamic";
 
 export const CATEGORY_LABELS: Record<ChannelCategory, string> = {
   "pk-entertainment": "Pakistani Entertainment",
+  "pk-movies": "Pakistani Movies",
   "pk-sports": "Pakistani Sports",
   "pk-news": "Pakistani News",
   "in-entertainment": "Indian Entertainment",
   "in-movies": "Indian Movies",
   sports: "Sports & Cricket",
   "in-news": "Indian News",
+  islamic: "Islamic",
 };
 
 // ── Curated channel list ────────────────────────────────────────────────────
@@ -59,8 +63,9 @@ const CURATED: Channel[] = [
     category: "pk-entertainment",
     country: "pk",
     type: "hls",
-    url: "",
+    url: "https://cdn4.mjunoon.tv:8087/streamtest/118M/chunks.m3u8",
     fallbacks: [],
+    logo: "https://i.imgur.com/uu0UJme.png",
   },
   {
     id: "hum-tv",
@@ -70,6 +75,7 @@ const CURATED: Channel[] = [
     type: "hls",
     url: "https://g4wlkwx8l23a-hls-live.5centscdn.com/HUM/271ddf829afeece44d8732757fba1a66.sdp/playlist.m3u8",
     fallbacks: [],
+    logo: "https://i.ibb.co/Tx4GfKT5/Hum-TV-HD.png",
   },
   {
     id: "express-entertainment",
@@ -79,6 +85,7 @@ const CURATED: Channel[] = [
     type: "hls",
     url: "https://ml-pull-dvc-myco.io:2096/EXPRESS_ENTERTAINMENT/index.m3u8",
     fallbacks: [],
+    logo: "https://i.imgur.com/rgHbb8W.png",
   },
   {
     id: "atv-pk",
@@ -88,6 +95,89 @@ const CURATED: Channel[] = [
     type: "hls",
     url: "",
     fallbacks: [],
+    logo: "https://upload.wikimedia.org/wikipedia/en/8/83/Atv_pakistan.PNG",
+  },
+  {
+    id: "bol-entertainment",
+    name: "Bol Entertainment",
+    category: "pk-entertainment",
+    country: "pk",
+    type: "hls",
+    url: "https://vodzong.mjunoon.tv:8087/streamtest/Channel5-159-4/playlist.m3u8",
+    fallbacks: [],
+    logo: "https://i.imgur.com/eajSRFo.png",
+  },
+  {
+    id: "aaj-entertainment",
+    name: "Aaj Entertainment",
+    category: "pk-entertainment",
+    country: "pk",
+    type: "hls",
+    url: "https://ml-pull-dvc-myco.io:2096/AAJ_ENTERTAINMENT/index.m3u8",
+    fallbacks: [],
+    logo: "https://i.ibb.co/xt5RBDds/Aaj-Entertainment-HD.png",
+  },
+  {
+    id: "harpal-geo",
+    name: "HarPal Geo",
+    category: "pk-entertainment",
+    country: "pk",
+    type: "hls",
+    url: "https://jk3lz82elw79-hls-live.5centscdn.com/harPalGeo/955ad3298db330b5ee880c2c9e6f23a0.sdp/playlist.m3u8",
+    fallbacks: [],
+    logo: "https://i.imgur.com/NX3vvAX.png",
+  },
+  {
+    id: "8xm",
+    name: "8XM",
+    category: "pk-entertainment",
+    country: "pk",
+    type: "hls",
+    url: "https://cdn4.mjunoon.tv:8087/streamtest/131M/chunks.m3u8",
+    fallbacks: [],
+    logo: "https://i.ibb.co/Kc0xHyBb/8XM-Logo.png",
+  },
+  {
+    id: "discover-pakistan",
+    name: "Discover Pakistan",
+    category: "pk-entertainment",
+    country: "pk",
+    type: "hls",
+    url: "https://livecdn.live247stream.com/discoverpakistan/web/playlist.m3u8",
+    fallbacks: [],
+    logo: "https://i.imgur.com/IJH47fJ.png",
+  },
+
+  // — Pakistani Movies —
+  {
+    id: "filmax",
+    name: "Filmax",
+    category: "pk-movies",
+    country: "pk",
+    type: "hls",
+    url: "https://s3.ideationtec.live/Filmax/Filmax.m3u8",
+    fallbacks: [],
+    logo: "https://i.imgur.com/eLmdZ6k.png",
+  },
+  {
+    id: "bs-film",
+    name: "BS Film",
+    category: "pk-movies",
+    country: "pk",
+    type: "hls",
+    url: "https://live20.bozztv.com/akamaissh101/ssh101/bsfilm/playlist.m3u8",
+    fallbacks: [],
+    logo: "https://www.vivalivetv.com/public/files/shows/0/1/3953-640x360-FFFFFF.jpg",
+  },
+  {
+    id: "filmazia",
+    name: "Filmazia",
+    category: "pk-movies",
+    country: "pk",
+    type: "hls",
+    url: "http://103.250.28.74:8000/play/a02k/index.m3u8",
+    fallbacks: [],
+    logo: "https://i.imgur.com/hpTCANa.png",
   },
 
   // — Pakistani Sports —
@@ -97,8 +187,9 @@ const CURATED: Channel[] = [
     category: "pk-sports",
     country: "pk",
     type: "hls",
-    url: "",
+    url: "https://cdn.rabta.stream/M-Sports/index.m3u8",
     fallbacks: [],
+    logo: "https://msports.pk/wp-content/uploads/2026/02/m-sports-300.png",
   },
   {
     id: "ptv-sports",
@@ -106,8 +197,19 @@ const CURATED: Channel[] = [
     category: "pk-sports",
     country: "pk",
     type: "hls",
-    url: "",
+    url: "https://tvsen7.aynascope.net/Sports1/index.m3u8",
     fallbacks: [],
+    logo: "https://i.imgur.com/CPm6GHA.png",
+  },
+  {
+    id: "pk-sports",
+    name: "PK Sports",
+    category: "pk-sports",
+    country: "pk",
+    type: "hls",
+    url: "https://lbgo.bozztv.com/ssh101/ssh101/pksportshd/playlist.m3u8",
+    fallbacks: [],
+    logo: "https://raw.githubusercontent.com/songwenhui239/Songwenhui239/refs/heads/main/PK%20Sports.jpeg",
   },
 
   // — Pakistani News (verified HLS 2026-10-08) —
@@ -119,6 +221,7 @@ const CURATED: Channel[] = [
     type: "hls",
     url: "https://intl.dunyanews.tv/livehd/ngrp:dunyalivehd_2_all/playlist.m3u8",
     fallbacks: [],
+    logo: "https://i.imgur.com/1PbtW0y.png",
   },
   {
     id: "92-news",
@@ -128,6 +231,7 @@ const CURATED: Channel[] = [
     type: "hls",
     url: "http://92news.vdn.dstreamone.net/92newshd/92hd/playlist.m3u8",
     fallbacks: [],
+    logo: "https://i.imgur.com/gp1Ao4s.jpeg",
   },
   {
     id: "samaa-tv",
@@ -137,6 +241,7 @@ const CURATED: Channel[] = [
     type: "hls",
     url: "https://vodzong.mjunoon.tv:8087/streamtest/SAMAA-173/playlist.m3u8",
     fallbacks: [],
+    logo: "https://i.imgur.com/r3U4A1P.png",
   },
   {
     id: "geo-news",
@@ -152,9 +257,80 @@ const CURATED: Channel[] = [
     name: "ARY News",
     category: "pk-news",
     country: "pk",
-    type: "youtube",
-    url: "https://www.youtube.com/@ARYNews/live",
+    type: "hls",
+    url: "https://cdn07lhr.tamashaweb.com:8087/jazzauth/vsat-arynews-abr/live/vsat-arynews-H/chunks_dvr_timeshift-0-3600.m3u8",
+    fallbacks: ["https://www.youtube.com/@ARYNews/live"],
+    logo: "https://i.imgur.com/R4KtTbJ.jpg",
+  },
+  {
+    id: "24-news-hd",
+    name: "24 News HD",
+    category: "pk-news",
+    country: "pk",
+    type: "hls",
+    url: "https://cdn4.mjunoon.tv:8087/streamtest/146M/chunks.m3u8",
     fallbacks: [],
+    logo: "https://upload.wikimedia.org/wikipedia/en/9/93/24_News_HD_Logo.png",
+  },
+  {
+    id: "capital-tv",
+    name: "Capital TV",
+    category: "pk-news",
+    country: "pk",
+    type: "hls",
+    url: "https://cdn4.mjunoon.tv:8087/streamtest/111M/chunks.m3u8",
+    fallbacks: [],
+    logo: "https://i.imgur.com/UxAE5O4.png",
+  },
+  {
+    id: "neo-news",
+    name: "Neo News",
+    category: "pk-news",
+    country: "pk",
+    type: "hls",
+    url: "https://vodzong.mjunoon.tv:8087/streamtest/Neo-110/playlist.m3u8",
+    fallbacks: [],
+    logo: "https://i.imgur.com/9mrbPRs.png",
+  },
+  {
+    id: "news-one",
+    name: "News One",
+    category: "pk-news",
+    country: "pk",
+    type: "hls",
+    url: "https://vodzong.mjunoon.tv:8087/streamtest/NEWS1-128/playlist.m3u8",
+    fallbacks: [],
+    logo: "https://i.imgur.com/ivrRYMk.png",
+  },
+  {
+    id: "lahore-news",
+    name: "Lahore News",
+    category: "pk-news",
+    country: "pk",
+    type: "hls",
+    url: "https://vcdn.dunyanews.tv/lahorelive/ngrp:lnews_1_all/playlist.m3u8",
+    fallbacks: [],
+    logo: "https://i.imgur.com/bQfQeEA.jpeg",
+  },
+  {
+    id: "ktn-news",
+    name: "KTN News",
+    category: "pk-news",
+    country: "pk",
+    type: "hls",
+    url: "https://vodzong.mjunoon.tv:8087/streamtest/KTNNews-151/playlist.m3u8",
+    fallbacks: [],
+    logo: "https://i.imgur.com/RtEzpPQ.png",
+  },
+  {
+    id: "such-tv",
+    name: "Such TV",
+    category: "pk-news",
+    country: "pk",
+    type: "hls",
+    url: "https://video.primexsports.com/suchnews/live/playlist.m3u8",
+    fallbacks: [],
+    logo: "https://i.imgur.com/yYMh3JJ.png",
   },
 
   // — Indian Entertainment —
@@ -166,6 +342,7 @@ const CURATED: Channel[] = [
     type: "hls",
     url: "http://51.75.127.199:3141/starplushd/index.m3u8",
     fallbacks: [],
+    logo: "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/india/star-plus-in.png",
   },
   {
     id: "colors-tv",
@@ -184,6 +361,67 @@ const CURATED: Channel[] = [
     type: "hls",
     url: "http://38.96.178.205/SONYHD/index.m3u8",
     fallbacks: [],
+    logo: "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/india/sony-entertainment-television-in.png",
+  },
+  {
+    id: "star-utsav",
+    name: "Star Utsav",
+    category: "in-entertainment",
+    country: "in",
+    type: "hls",
+    url: "http://51.75.127.199:3141/starutsav/index.m3u8",
+    fallbacks: [],
+    logo: "https://dtil.tmsimg.com/assets/s159132_ld_h15_aa.png?lock=720x540",
+  },
+  {
+    id: "zee-tv",
+    name: "Zee TV",
+    category: "in-entertainment",
+    country: "in",
+    type: "hls",
+    url: "http://51.75.127.199:3141/zeetv/index.m3u8",
+    fallbacks: [],
+    logo: "https://xstreamcp-assets-msp.streamready.in/assets/LIVETV/LIVECHANNEL/LIVETV_LIVETVCHANNEL_ZEE_TV/images/LOGO_HD/LOGO_HD_image.png",
+  },
+  {
+    id: "star-bharat",
+    name: "Star Bharat",
+    category: "in-entertainment",
+    country: "in",
+    type: "hls",
+    url: "http://51.75.127.199:3141/starbharat/index.m3u8",
+    fallbacks: [],
+    logo: "https://i.imgur.com/Q8ajPij.png",
+  },
+  {
+    id: "9x-jalwa",
+    name: "9X Jalwa",
+    category: "in-entertainment",
+    country: "in",
+    type: "hls",
+    url: "https://wiselp.wiseplayout.com/9X_Jalwa/master.m3u8",
+    fallbacks: [],
+    logo: "https://xstreamcp-assets-msp.streamready.in/assets/LIVETV/LIVECHANNEL/LIVETV_LIVETVCHANNEL_9X_JALWA/images/LOGO_HD/image.png",
+  },
+  {
+    id: "b4u-music",
+    name: "B4U Music",
+    category: "in-entertainment",
+    country: "in",
+    type: "hls",
+    url: "https://amg01408-amg01408c5-amgplt0747.playout.now3.amagi.tv/b4um001/playlist.m3u8",
+    fallbacks: [],
+    logo: "https://dtil.tmsimg.com/assets/s158141_ld_h15_aa.png?lock=720x540",
+  },
+  {
+    id: "zoom-tv",
+    name: "Zoom",
+    category: "in-entertainment",
+    country: "in",
+    type: "hls",
+    url: "https://dai.google.com/linear/hls/event/JCAm25qkRXiKcK1AJMlvKQ/master.m3u8",
+    fallbacks: [],
+    logo: "https://xstreamcp-assets-msp.streamready.in/assets/LIVETV/LIVECHANNEL/LIVETV_LIVETVCHANNEL_ZOOM/images/LOGO_HD/image.png",
   },
 
   // — Indian Movies —
@@ -195,6 +433,7 @@ const CURATED: Channel[] = [
     type: "hls",
     url: "http://51.75.127.199:3141/stargoldselecthd/index.m3u8",
     fallbacks: [],
+    logo: "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/india/star-gold-in.png",
   },
   {
     id: "sony-max",
@@ -204,6 +443,7 @@ const CURATED: Channel[] = [
     type: "hls",
     url: "http://107.167.16.138/sonymax2/index.m3u8?token=test",
     fallbacks: [],
+    logo: "https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/india/sony-max-in.png",
   },
   {
     id: "zee-cinema",
@@ -222,6 +462,36 @@ const CURATED: Channel[] = [
     type: "hls",
     url: "http://51.75.127.199:3141/colorscineplexhd/index.m3u8",
     fallbacks: ["http://51.75.127.199:3141/colorscineplexbollywood/index.m3u8"],
+  },
+  {
+    id: "all-time-movies",
+    name: "All Time Movies",
+    category: "in-movies",
+    country: "in",
+    type: "hls",
+    url: "https://samitaorigin.tangotv.in/ALLTIMEMOVIES/SAMITAORIGIN/index.m3u8",
+    fallbacks: [],
+    logo: "https://yt3.googleusercontent.com/U4INXhwmEUOABHoemQBpI6C9t4jb9iBmDvZ3ZT3lAb9Au_jVl32NL8XDpy-9cBjRJ2LP69Ovzg=s900-c-k-c0x00ffffff-no-rj",
+  },
+  {
+    id: "star-utsav-movies",
+    name: "Star Utsav Movies",
+    category: "in-movies",
+    country: "in",
+    type: "hls",
+    url: "http://51.75.127.199:3141/starutsavmovies/index.m3u8",
+    fallbacks: [],
+    logo: "https://dtil.tmsimg.com/assets/s143856_ld_h15_aa.png?lock=720x540",
+  },
+  {
+    id: "b4u-movies",
+    name: "B4U Movies",
+    category: "in-movies",
+    country: "in",
+    type: "hls",
+    url: "https://streams.tangotv.in/B4UMOVIES/ORIGIN/index.m3u8",
+    fallbacks: [],
+    logo: "https://i.imgur.com/M9kMFJl.png",
   },
 
   // — Sports & Cricket —
@@ -242,6 +512,7 @@ const CURATED: Channel[] = [
     type: "hls",
     url: "",
     fallbacks: [],
+    logo: "https://img10.hotstar.com/image/upload/f_auto/sources/r1/cms/prod/7957/1783000567957-h.jpg",
   },
   {
     id: "sony-ten-1",
@@ -258,8 +529,39 @@ const CURATED: Channel[] = [
     category: "sports",
     country: "in",
     type: "hls",
-    url: "",
+    url: "https://mumbai-edge.smartplaytv.in/DDSports/index.m3u8",
     fallbacks: [],
+    logo: "https://ltsk-cdn.s3.eu-west-1.amazonaws.com/jumpstart/Temp_Live/cdn/HLS/Channel/transparentImages/DD%20Sports.png",
+  },
+  {
+    id: "star-sports-select-1",
+    name: "Star Sports Select 1",
+    category: "sports",
+    country: "in",
+    type: "hls",
+    url: "http://103.151.60.162:2122/play/a026/index.m3u8?hls",
+    fallbacks: [],
+    logo: "https://img10.hotstar.com/image/upload/f_auto/sources/r1/cms/prod/1176/1783001141176-h.jpg",
+  },
+  {
+    id: "star-sports-select-2",
+    name: "Star Sports Select 2",
+    category: "sports",
+    country: "in",
+    type: "hls",
+    url: "http://103.151.60.162:2122/play/a027/index.m3u8?hls",
+    fallbacks: [],
+    logo: "https://img10.hotstar.com/image/upload/f_auto/sources/r1/cms/prod/7266/1783001217266-h.jpg",
+  },
+  {
+    id: "ten-cricket",
+    name: "Ten Cricket",
+    category: "sports",
+    country: "in",
+    type: "hls",
+    url: "http://103.151.60.162:2122/play/a0fj/index.m3u8?hls",
+    fallbacks: [],
+    logo: "https://i.imgur.com/K5XIFuW.png",
   },
   {
     id: "cricket-gold",
@@ -280,15 +582,119 @@ const CURATED: Channel[] = [
     type: "hls",
     url: "https://d1rc86nwwc9fag.cloudfront.net/vglive-sk-472500/abpnews/master.m3u8",
     fallbacks: [],
+    logo: "https://upload.wikimedia.org/wikipedia/commons/thumb/4/48/ABP_News_logo.svg/500px-ABP_News_logo.svg.png",
   },
   {
     id: "aaj-tak",
     name: "Aaj Tak",
     category: "in-news",
     country: "in",
-    type: "youtube",
-    url: "https://www.youtube.com/@aajtak/live",
+    type: "hls",
+    url: "https://livehub-voidnet.onrender.com/cluster/streamcore/in/AAJTAK_REDIS.m3u8",
+    fallbacks: ["https://www.youtube.com/@aajtak/live"],
+    logo: "https://i.imgur.com/gS9Qkfy.png",
+  },
+  {
+    id: "india-tv",
+    name: "India TV",
+    category: "in-news",
+    country: "in",
+    type: "hls",
+    url: "https://pl-indiatvnews.akamaized.net/out/v1/db79179b608641ceaa5a4d0dd0dca8da/index.m3u8",
     fallbacks: [],
+    logo: "https://xstreamcp-assets-msp.streamready.in/assets/LIVETV/LIVECHANNEL/LIVETV_LIVETVCHANNEL_INDIA_TV/images/LOGO_HD/image.png",
+  },
+  {
+    id: "zee-news",
+    name: "Zee News",
+    category: "in-news",
+    country: "in",
+    type: "hls",
+    url: "https://dknttpxmr0dwf.cloudfront.net/index_57.m3u8",
+    fallbacks: [],
+    logo: "https://dtil.tmsimg.com/assets/GNLZZGG0023VWYC.png?lock=720x540",
+  },
+
+  // — Islamic (verified live 2026-10-08) —
+  {
+    id: "makkah-tv",
+    name: "Makkah TV",
+    category: "islamic",
+    country: "int",
+    type: "hls",
+    url: "https://media2.streambrothers.com:1936/8122/8122/playlist.m3u8",
+    fallbacks: [],
+    logo: "https://i.ibb.co/r2k71w5N/download.png",
+  },
+  {
+    id: "madani-channel-urdu",
+    name: "Madani Channel Urdu",
+    category: "islamic",
+    country: "pk",
+    type: "hls",
+    url: "https://streaming.madanichannel.tv/static/streaming-playlists/hls/b9790f10-cb0d-4e30-82bf-84a756234e58/master.m3u8",
+    fallbacks: [],
+    logo: "https://i.imgur.com/MitLeCJ.png",
+  },
+  {
+    id: "madani-channel-english",
+    name: "Madani Channel English",
+    category: "islamic",
+    country: "pk",
+    type: "hls",
+    url: "http://tvsen7.aynascope.net/MadaniTV/index.m3u8",
+    fallbacks: [],
+    logo: "https://i.imgur.com/Abi9j0A.png",
+  },
+  {
+    id: "peace-tv-urdu",
+    name: "Peace TV Urdu",
+    category: "islamic",
+    country: "pk",
+    type: "hls",
+    url: "https://dzkyvlfyge.erbvr.com/PeaceTvUrdu/index.m3u8",
+    fallbacks: [],
+    logo: "https://github.com/fawazahmed0/tiger/raw/master/peace/urdu.jpg",
+  },
+  {
+    id: "peace-tv-english",
+    name: "Peace TV English",
+    category: "islamic",
+    country: "int",
+    type: "hls",
+    url: "https://dzkyvlfyge.erbvr.com/PeaceTvEnglish/index.m3u8",
+    fallbacks: [],
+    logo: "https://i.imgur.com/rjgCM2B.png",
+  },
+  {
+    id: "huda-tv",
+    name: "Huda TV",
+    category: "islamic",
+    country: "int",
+    type: "hls",
+    url: "https://cdn.bestream.io:19360/elfaro1/elfaro1.m3u8",
+    fallbacks: [],
+    logo: "https://i.imgur.com/1UUjU26.png",
+  },
+  {
+    id: "iqraa-quran",
+    name: "Iqraa Quran",
+    category: "islamic",
+    country: "int",
+    type: "hls",
+    url: "https://playlist.fasttvcdn.com/pl/dlkqw1ftuvuuzkcb4pxdcg/Iqraafasttv2/playlist.m3u8",
+    fallbacks: [],
+    logo: "https://i.imgur.com/HPVsIa4.png",
+  },
+  {
+    id: "quran-tv",
+    name: "Quran TV",
+    category: "islamic",
+    country: "int",
+    type: "hls",
+    url: "https://ncdn.telewebion.ir/quran/live/playlist.m3u8",
+    fallbacks: [],
+    logo: "https://upload.wikimedia.org/wikipedia/fa/d/df/Quarntvlogo.png",
   },
 ];
 
@@ -425,16 +831,22 @@ export async function refreshChannels(): Promise<RefreshResult> {
   const channels: Channel[] = await Promise.all(
     CURATED.map(async (ch): Promise<Channel> => {
       const key = norm(ch.name);
-      const candidates: string[] = [];
+      const candidates: { url: string; logo?: string }[] = [];
+      const seen = new Set<string>();
+
+      const addCandidate = (e: PlaylistEntry) => {
+        if (!seen.has(e.url)) {
+          seen.add(e.url);
+          candidates.push({ url: e.url, logo: e.logo });
+        }
+      };
 
       // Direct name match + common variants
       const variants = [key, key.replace(/tv$/, ""), key.replace(/^sony/, "set")];
       for (const v of variants) {
         const entries = index.get(v);
         if (entries) {
-          for (const e of entries) {
-            if (!candidates.includes(e.url)) candidates.push(e.url);
-          }
+          for (const e of entries) addCandidate(e);
         }
       }
 
@@ -443,31 +855,32 @@ export async function refreshChannels(): Promise<RefreshResult> {
         for (const [k, entries] of index) {
           if (k.includes(key) || key.includes(k)) {
             for (const e of entries) {
-              if (!candidates.includes(e.url) && candidates.length < 5) {
-                candidates.push(e.url);
-              }
+              if (candidates.length < 5) addCandidate(e);
             }
           }
         }
       }
 
+      // Logo: curated first, else first playlist tvg-logo found.
+      const harvestedLogo = ch.logo || candidates.find((c) => c.logo)?.logo || "";
+
       // Keep curated URL as first candidate (it's verified)
-      const all = ch.url ? [ch.url, ...candidates] : candidates;
+      const all = ch.url ? [{ url: ch.url, logo: ch.logo }, ...candidates] : candidates;
 
       // Probe in parallel, keep alive ones
-      const probes = await Promise.all(all.map((u) => probeUrl(u)));
+      const probes = await Promise.all(all.map((u) => probeUrl(u.url)));
       const alive = all.filter((_, i) => probes[i]);
 
-      // YouTube channels: no probing (NewPipe resolves at play time)
+      // YouTube channels: no probing (resolved at play time)
       if (ch.type === "youtube") {
-        return { ...ch, fallbacks: candidates.slice(0, 3) };
+        return { ...ch, fallbacks: candidates.slice(0, 3).map((c) => c.url), logo: harvestedLogo };
       }
 
       return {
         ...ch,
-        url: alive[0] || "",
-        fallbacks: alive.slice(1, 4),
-        logo: ch.logo,
+        url: alive[0]?.url || "",
+        fallbacks: alive.slice(1, 4).map((a) => a.url),
+        logo: harvestedLogo,
       };
     })
   );
