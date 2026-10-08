@@ -160,6 +160,17 @@ export default async function handler(req: any, res: any) {
           "GET /v1/cron/livetv-refresh",
           "GET /v1/cron/fz-warm?tmdbId=",
         ],
+        // P2-2 (2026-10-08): canonical auth contract. X-PF-Timestamp MUST
+        // be unix MILLISECONDS (Date.now()); seconds-epoch values are
+        // rejected as STALE_TIMESTAMP by verifyHmacParts.
+        auth: {
+          apiKey: { header: "X-API-Key", note: "day-1 app key; ?api_key= query fallback removed" },
+          hmac: {
+            headers: ["X-PF-Device", "X-PF-Timestamp", "X-PF-Token", "X-PF-Signature"],
+            timestamp: "unix MILLISECONDS (Date.now()); seconds-epoch values are rejected as STALE_TIMESTAMP",
+            windowSeconds: 300,
+          },
+        },
       });
     }
 
