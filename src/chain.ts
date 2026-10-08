@@ -20,6 +20,7 @@ import { vidzee } from "./providers/vidzee.js";
 import { fzmovies, warmFZMovies } from "./providers/fzmovies.js";
 import { tmdb } from "./tmdb.js";
 import type { ProviderFn, ProviderResult } from "./providers/types.js";
+import { NotAvailableError } from "./providers/types.js";
 
 // ── Stubs (Phase 1b — return null so chain skips them) ───────────────────────
 const notYet = (_name: string): ProviderFn => async () => {
@@ -144,7 +145,11 @@ async function tryProvider(
     }
     recordFail(p.name);
     return null;
-  } catch {
+  } catch (e) {
+    // "Not available" (e.g. VidZee 404/502 = no Hindi for this title) is a
+    // correct provider response, NOT a failure. Don't trip the circuit
+    // breaker — otherwise 5x "no Hindi" would block Hindi for everyone.
+    if (e instanceof NotAvailableError) return null;
     recordFail(p.name);
     return null;
   }
@@ -317,7 +322,7 @@ function labelFor(code: string): string {
  * - When the original IS Hindi (e.g. Drishyam), "hi" covers both the original
  *   and any dub — no duplicate entry, no fake "English".
  *
- * Budget: ~4s max — fits the Vercel Hobby 10s window with room to spare.
+ * Budget: ~8s max — fits the Vercel 60s window with room to spare.
  * Returns e.g. { original: "hi", audio: ["hi"], playing: "hi" } for Drishyam,
  * or { original: "en", audio: ["hi", "en"], playing: "hi" } for Avengers.
  */
@@ -363,7 +368,7 @@ export async function availableAudio(
 
     const results = await Promise.race([
       Promise.all(checks),
-      new Promise<boolean[]>((res) => setTimeout(() => res([false]), 5000)),
+      new Promise<boolean[]>((res) => setTimeout(() => res([false]), 8000)),
     ]);
     hindiDub = results.some(Boolean);
   }

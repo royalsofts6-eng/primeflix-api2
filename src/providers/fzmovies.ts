@@ -29,13 +29,17 @@ import { tmdb } from "../tmdb.js";
 import type { ProviderFn, ProviderResult, StreamQuality } from "./types.js";
 
 const FZ_BASE = (process.env.FZ_BASE_URL || "https://www.fzmovies.host").replace(/\/$/, "");
-const FZ_FALLBACKS = (process.env.FZ_FALLBACK_URLS || "https://fzmovies.host")
+// NOTE: "https://fzmovies.host" (no www) is DEAD (verified 2026-10-08) —
+// do NOT add it as a fallback, it just wastes time. Add working mirrors via env.
+const FZ_FALLBACKS = (process.env.FZ_FALLBACK_URLS || "")
   .split(",")
   .map((s) => s.trim().replace(/\/$/, ""))
   .filter(Boolean);
 
 const UA = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36";
-const HOP_TIMEOUT_MS = 25000;
+// 40s per hop (was 25s): site takes 7-15s normally, spikes to 30s+ when flaky.
+// Verified 2026-10-08: search POST took 14.7s on a good attempt.
+const HOP_TIMEOUT_MS = 40000;
 const CACHE_TTL_MS = 10 * 60 * 60_000; // 10h (links live 12h)
 
 // ── Circuit breaker: 3 consecutive fails → 15 min cooldown ───────────────────
@@ -224,14 +228,19 @@ export async function fzmoviesLive(
 
   const bases = [FZ_BASE, ...FZ_FALLBACKS];
   let lastErr: unknown = null;
-  for (const base of bases) {
-    try {
-      const result = await resolveOnBase(base, title, year);
-      recordOk();
-      return result;
-    } catch (e) {
-      lastErr = e;
+  // Two attempts: the site is flaky (verified 2026-10-08: search sometimes
+  // 200 in 7s, sometimes 30s+ timeout). One retry with a breather often works.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    for (const base of bases) {
+      try {
+        const result = await resolveOnBase(base, title, year);
+        recordOk();
+        return result;
+      } catch (e) {
+        lastErr = e;
+      }
     }
+    if (attempt === 0) await new Promise((r) => setTimeout(r, 3000));
   }
   recordFail();
   throw lastErr instanceof Error ? lastErr : new Error("fzmovies resolve failed");

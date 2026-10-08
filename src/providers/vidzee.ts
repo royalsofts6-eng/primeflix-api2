@@ -13,11 +13,14 @@
  * Chain tries VidZee before VidLink; on miss the normal chain takes over.
  */
 import type { ProviderResult, StreamQuality } from "./types.js";
+import { NotAvailableError } from "./types.js";
 
 const BASE = "https://core.vidzee.wtf";
-// Short timeout: this runs BEFORE the main chain inside resolveStream,
-// so it must not eat the Vercel Hobby 10s budget (chain uses up to 8s).
-const FETCH_TIMEOUT_MS = 3500;
+// 7s timeout (was 3.5s — too aggressive: live TV requests take 3.8s+,
+// Jawan 3.2s. Vercel maxDuration is 60s so we have room).
+// ?audio=hi path: 7s VidZee + fast FZMovies cache + VidLink — well under budget.
+// Default Hindi-first path: 7s + 8s chain = 15s < 60s. Safe.
+const FETCH_TIMEOUT_MS = 7000;
 
 function extractQuality(url: string): string {
   // URLs look like: .../Avengers_Infinity_War_720/index_384.m3u8
@@ -52,7 +55,12 @@ export async function vidzee(
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
   } catch {
-    return null;
+    return null; // network/timeout = provider error (circuit breaker counts it)
+  }
+  // 404/502 = "this title has no Hindi dub" — NOT a provider failure.
+  // Throw NotAvailableError so the circuit breaker doesn't count it.
+  if (res.status === 404 || res.status === 502) {
+    throw new NotAvailableError(`vidzee: no Hindi for ${tmdbId} (http ${res.status})`);
   }
   if (!res.ok) return null;
 
