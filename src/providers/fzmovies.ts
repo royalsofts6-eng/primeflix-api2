@@ -28,8 +28,8 @@ import { cacheGet, cacheSet } from "../cache.js";
 import { tmdb } from "../tmdb.js";
 import type { ProviderFn, ProviderResult, StreamQuality } from "./types.js";
 
-const FZ_BASE = (process.env.FZ_BASE_URL || "https://fzmovies.host").replace(/\/$/, "");
-const FZ_FALLBACKS = (process.env.FZ_FALLBACK_URLS || "")
+const FZ_BASE = (process.env.FZ_BASE_URL || "https://www.fzmovies.host").replace(/\/$/, "");
+const FZ_FALLBACKS = (process.env.FZ_FALLBACK_URLS || "https://fzmovies.host")
   .split(",")
   .map((s) => s.trim().replace(/\/$/, ""))
   .filter(Boolean);

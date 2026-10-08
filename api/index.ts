@@ -3,7 +3,7 @@
  * Uniform contract: { success: true, data } | { success: false, error, code }
  */
 import { tmdb, TTL } from "../src/tmdb.js";
-import { resolveStream, providerHealth } from "../src/chain.js";
+import { resolveStream, providerHealth, availableAudio } from "../src/chain.js";
 import { fzmovies, warmFZMovies, fzStats } from "../src/providers/fzmovies.js";
 import { cacheStats } from "../src/cache.js";
 import { getSeries, getEpisodes, getStreamUrl, NIAZI_TTL } from "../src/niazitv.js";
@@ -112,6 +112,8 @@ export default async function handler(req: any, res: any) {
           "GET /v1/tmdb/movie/:id/recommendations",
           "GET /v1/tmdb/tv/:id/recommendations",
           "GET /v1/stream/movie/:tmdbId",
+          "GET /v1/stream/movie/:tmdbId/languages",
+          "GET /v1/stream/tv/:tmdbId/:season/:episode/languages",
           "GET /v1/stream/tv/:tmdbId/:season/:episode",
           "POST /v1/auth/register",
           "POST /v1/auth/refresh",
@@ -190,6 +192,18 @@ export default async function handler(req: any, res: any) {
       if (query.length < 2) return send(res, 400, fail("query too short", "BAD_QUERY"));
       const data = await tmdb.search(query, q.get("page") || "1");
       return send(res, 200, ok(data), edgeCache(TTL.search, TTL.stale1d));
+    }
+
+    // Available audio languages (Ali 2026-10-08: dub button shows ONLY what
+    // actually exists — VidZee/FZMovies Hindi check + always English).
+    // MUST sit before the /v1/stream/movie/:tmdbId regex below.
+    if ((m = path.match(/^\/v1\/stream\/movie\/([^/]+)\/languages$/))) {
+      const audio = await availableAudio(m[1], "movie");
+      return send(res, 200, ok({ audio }), { "Cache-Control": "no-store" });
+    }
+    if ((m = path.match(/^\/v1\/stream\/tv\/([^/]+)\/([^/]+)\/([^/]+)\/languages$/))) {
+      const audio = await availableAudio(m[1], "tv", num(m[2], 1), num(m[3], 1));
+      return send(res, 200, ok({ audio }), { "Cache-Control": "no-store" });
     }
 
     // Stream resolution (NEVER cache — signed URLs expire)

@@ -249,3 +249,61 @@ export async function resolveStream(
   if (!result) throw new Error("all providers failed");
   return { ...result, resolvedBy: result.provider, latencyMs: Date.now() - t0 };
 }
+
+/**
+ * Available audio languages for a title (Ali 2026-10-08: dub button must show
+ * ONLY languages that are actually available, not a hardcoded list).
+ *
+ * - "en": always available (VidLink English chain).
+ * - "hi": available if VidZee has Hindi-dubbed (fast check, 3.5s internal
+ *   timeout) OR the FZMovies cache has it (instant memory lookup).
+ *
+ * Budget: ~4s max — fits the Vercel Hobby 10s window with room to spare.
+ * Returns e.g. ["hi", "en"] or ["en"].
+ */
+export async function availableAudio(
+  tmdbId: string,
+  type: "movie" | "tv",
+  season?: number,
+  episode?: number
+): Promise<string[]> {
+  const langs = ["en"]; // English/original always available via VidLink
+
+  const hindiEntry: ProviderEntry = { name: "vidzee", fn: vidzee };
+  const fzEntry: ProviderEntry = { name: "fzmovies", fn: fzmovies };
+
+  // Parallel: VidZee live check + FZMovies cache check. Either hit = Hindi.
+  const checks: Promise<boolean>[] = [];
+  if (!circuitOpen(hindiEntry.name)) {
+    checks.push(
+      (async () => {
+        try {
+          const r = await vidzee(tmdbId, type, season, episode);
+          return !!(r && r.qualities.length > 0);
+        } catch {
+          return false;
+        }
+      })()
+    );
+  }
+  // FZMovies cache-only check is instant and never throws meaningfully.
+  checks.push(
+    (async () => {
+      try {
+        const r = await fzmovies(tmdbId, type);
+        return !!(r && r.qualities.length > 0);
+      } catch {
+        return false;
+      }
+    })()
+  );
+
+  const results = await Promise.race([
+    Promise.all(checks),
+    new Promise<boolean[]>((res) => setTimeout(() => res([false]), 5000)),
+  ]);
+  if (results.some(Boolean)) {
+    return ["hi", "en"];
+  }
+  return langs;
+}

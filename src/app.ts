@@ -12,7 +12,7 @@ import {
   securityStats,
 } from "./security/middleware.js";
 import { tmdb, TTL, edgeCacheHeaders } from "./tmdb.js";
-import { resolveStream, providerHealth } from "./chain.js";
+import { resolveStream, providerHealth, availableAudio } from "./chain.js";
 import { cacheStats } from "./cache.js";
 import { getChannels, refreshChannels, groupByCategory } from "./livetv.js";
 import { getSeries, getEpisodes, getStreamUrl, NIAZI_TTL } from "./niazitv.js";
@@ -147,6 +147,21 @@ app.get("/v1/tmdb/tv/:id/recommendations", wrap(async (c) => {
 
 // ── Stream resolution ───────────────────────────────────────────────────────
 // NOTE: stream URLs are signed/time-limited — NEVER cache these responses.
+app.get("/v1/stream/movie/:tmdbId/languages", wrap(async (c) => {
+  const audio = await availableAudio(c.req.param("tmdbId"), "movie");
+  return c.json({ success: true, data: { audio } }, 200, { "Cache-Control": "no-store" });
+}));
+
+app.get("/v1/stream/tv/:tmdbId/:season/:episode/languages", wrap(async (c) => {
+  const audio = await availableAudio(
+    c.req.param("tmdbId"),
+    "tv",
+    num(c.req.param("season"), 1),
+    num(c.req.param("episode"), 1)
+  );
+  return c.json({ success: true, data: { audio } }, 200, { "Cache-Control": "no-store" });
+}));
+
 app.get("/v1/stream/movie/:tmdbId", wrap(async (c) => {
   const data = await resolveStream(c.req.param("tmdbId"), "movie");
   return c.json({ success: true, data }, 200, { "Cache-Control": "no-store" });
