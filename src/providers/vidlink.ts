@@ -4,6 +4,7 @@
  */
 import nacl from "tweetnacl";
 import type { ProviderResult, StreamQuality, Subtitle } from "./types.js";
+import { fetchUpstream } from "./failures.js";
 
 const KEY_HEX =
   process.env.VIDLINK_KEY ||
@@ -66,7 +67,10 @@ export async function vidlink(
       ? `https://vidlink.pro/api/b/movie/${token}?multiLang=1`
       : `https://vidlink.pro/api/b/tv/${token}/${season ?? 1}/${episode ?? 1}?multiLang=1`;
 
-  const res = await fetch(url, {
+  // Classified fetch: non-2xx throws ProviderFailure (handled per-class in
+  // chain.ts — 404/403 -> next provider immediately, 429 -> Redis cooldown
+  // honoring Retry-After, timeout/5xx -> exactly 1 retry).
+  const res = await fetchUpstream("vidlink", url, {
     headers: {
       ...HEADERS,
       Referer:
@@ -76,7 +80,6 @@ export async function vidlink(
     },
     signal: AbortSignal.timeout(8000),
   });
-  if (!res.ok) return null;
   const data = await res.json();
   return parseResponse(data);
 }

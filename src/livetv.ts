@@ -75,7 +75,7 @@ const CURATED: Channel[] = [
     country: "pk",
     type: "hls",
     url: "https://g4wlkwx8l23a-hls-live.5centscdn.com/HUM/271ddf829afeece44d8732757fba1a66.sdp/playlist.m3u8",
-    fallbacks: [],
+    fallbacks: ["https://g4wlkwx8l23a-hls-live.5centscdn.com/HUM/271ddf829afeece44d8732757fba1a66.sdp/playlist_dvr.m3u8"], // P2 2026-10-09: verified live (dearbulut "Hum TV (720p)")
     logo: "https://i.ibb.co/Tx4GfKT5/Hum-TV-HD.png",
   },
   {
@@ -94,7 +94,10 @@ const CURATED: Channel[] = [
     category: "pk-entertainment",
     country: "pk",
     type: "hls",
-    url: "",
+    // P2 2026-10-09: promoted from backup — old primary was empty; this URL
+    // verified live (dearbulut "Star Sports 2 (576p)", same aggregator host
+    // as Star Sports Select 1/2 + Ten Cricket primaries).
+    url: "http://103.151.60.162:2122/play/a00v/index.m3u8?hls",
     fallbacks: [],
     logo: "https://upload.wikimedia.org/wikipedia/en/8/83/Atv_pakistan.PNG",
   },
@@ -167,7 +170,7 @@ const CURATED: Channel[] = [
     country: "pk",
     type: "hls",
     url: "https://live20.bozztv.com/akamaissh101/ssh101/bsfilm/playlist.m3u8",
-    fallbacks: [],
+    fallbacks: ["https://lbgo.bozztv.com/ssh101/ssh101/bsfilm/playlist.m3u8"], // P2 2026-10-09: verified live (dearbulut "BS Film (576p)")
     logo: "https://www.vivalivetv.com/public/files/shows/0/1/3953-640x360-FFFFFF.jpg",
   },
   {
@@ -221,7 +224,7 @@ const CURATED: Channel[] = [
     country: "pk",
     type: "hls",
     url: "https://intl.dunyanews.tv/livehd/ngrp:dunyalivehd_2_all/playlist.m3u8",
-    fallbacks: [],
+    fallbacks: ["https://imob.dunyanews.tv/livehd/ngrp:dunyalivehd_2_all/playlist.m3u8"], // P2 2026-10-09: verified live (dearbulut "Dunya News (720p)")
     logo: "https://i.imgur.com/1PbtW0y.png",
   },
   {
@@ -270,7 +273,7 @@ const CURATED: Channel[] = [
     country: "pk",
     type: "hls",
     url: "https://cdn4.mjunoon.tv:8087/streamtest/146M/chunks.m3u8",
-    fallbacks: [],
+    fallbacks: ["https://mumt07.tangotv.in/zHjX9OFlTWENTYFOURNEWS/index.m3u8"], // P2 2026-10-09: verified live (iptv-org "24 News (576p)")
     logo: "https://upload.wikimedia.org/wikipedia/en/9/93/24_News_HD_Logo.png",
   },
   {
@@ -421,7 +424,7 @@ const CURATED: Channel[] = [
     country: "in",
     type: "hls",
     url: "https://dai.google.com/linear/hls/event/JCAm25qkRXiKcK1AJMlvKQ/master.m3u8",
-    fallbacks: [],
+    fallbacks: ["https://d2esfk1pb9cdob.cloudfront.net/master.m3u8"], // P2 2026-10-09: verified live (dearbulut "Zoom (720p)")
     logo: "https://xstreamcp-assets-msp.streamready.in/assets/LIVETV/LIVECHANNEL/LIVETV_LIVETVCHANNEL_ZOOM/images/LOGO_HD/image.png",
   },
 
@@ -491,7 +494,7 @@ const CURATED: Channel[] = [
     country: "in",
     type: "hls",
     url: "https://streams.tangotv.in/B4UMOVIES/ORIGIN/index.m3u8",
-    fallbacks: [],
+    fallbacks: ["https://cdn.pishow.tv/ott/live/419/master.m3u8"], // P2 2026-10-09: verified live (dearbulut "B4U Movies (576p)")
     logo: "https://i.imgur.com/M9kMFJl.png",
   },
 
@@ -531,7 +534,7 @@ const CURATED: Channel[] = [
     country: "in",
     type: "hls",
     url: "https://mumbai-edge.smartplaytv.in/DDSports/index.m3u8",
-    fallbacks: [],
+    fallbacks: ["https://d3qs3d2rkhfqrt.cloudfront.net/out/v1/b17adfe543354fdd8d189b110617cddd/index.m3u8"], // P2 2026-10-09: verified live (dearbulut "DD Sports (1080p)")
     logo: "https://ltsk-cdn.s3.eu-west-1.amazonaws.com/jumpstart/Temp_Live/cdn/HLS/Channel/transparentImages/DD%20Sports.png",
   },
   {
@@ -644,7 +647,7 @@ const CURATED: Channel[] = [
     country: "pk",
     type: "hls",
     url: "http://tvsen7.aynascope.net/MadaniTV/index.m3u8",
-    fallbacks: [],
+    fallbacks: ["https://streaming.madanichannel.tv/static/streaming-playlists/hls/c6a600b0-82cb-454a-8953-2bb2bb372edc/master.m3u8"], // P2 2026-10-09: verified live (dearbulut "Madani Channel English (720p)")
     logo: "https://i.imgur.com/Abi9j0A.png",
   },
   {

@@ -7,13 +7,14 @@
  *   GET https://core.vidzee.wtf/streams/tv/{tmdb}/{s}/{e}?s=v6:Hindi
  *       → same shape
  * No API key, no Referer needed. Stream URL is a signed .m3u8 (HTTP 200,
- * valid HLS manifest verified). Missing titles → 502 (handled as null).
+ * valid HLS manifest verified). Missing titles → 404/502, classified as
+ * CONTENT_MISS (not a failure — never counted, never trips the circuit).
  *
  * Ali's preference (2026-10-08): Hindi dubbed audio FIRST, English fallback.
  * Chain tries VidZee before VidLink; on miss the normal chain takes over.
  */
 import type { ProviderResult, StreamQuality } from "./types.js";
-import { NotAvailableError } from "./types.js";
+import { fetchUpstream } from "./failures.js";
 
 const BASE = "https://core.vidzee.wtf";
 // 7s timeout (was 3.5s — too aggressive: live TV requests take 3.8s+,
@@ -48,21 +49,19 @@ export async function vidzee(
       ? `${BASE}/streams/movie/${tmdbId}?s=v6:Hindi`
       : `${BASE}/streams/tv/${tmdbId}/${season ?? 1}/${episode ?? 1}?s=v6:Hindi`;
 
-  let res: Response;
-  try {
-    res = await fetch(url, {
+  // Classified fetch. 404/502 = "this title has no Hindi dub" — NOT a
+  // provider failure: CONTENT_MISS (no retry, no fail counting, never trips
+  // the circuit — the 2026-10-08 'no Hindi' fix). Network errors and other
+  // statuses throw classified ProviderFailures handled per-class in chain.ts.
+  const res = await fetchUpstream(
+    "vidzee",
+    url,
+    {
       headers: { "User-Agent": "Mozilla/5.0 (Linux; Android 14)" },
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    });
-  } catch {
-    return null; // network/timeout = provider error (circuit breaker counts it)
-  }
-  // 404/502 = "this title has no Hindi dub" — NOT a provider failure.
-  // Throw NotAvailableError so the circuit breaker doesn't count it.
-  if (res.status === 404 || res.status === 502) {
-    throw new NotAvailableError(`vidzee: no Hindi for ${tmdbId} (http ${res.status})`);
-  }
-  if (!res.ok) return null;
+    },
+    { contentMissStatuses: [404, 502] }
+  );
 
   let data: any;
   try {

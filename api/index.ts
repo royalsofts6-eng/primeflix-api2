@@ -3,7 +3,7 @@
  * Uniform contract: { success: true, data } | { success: false, error, code }
  */
 import { tmdb, TTL } from "../src/tmdb.js";
-import { resolveStream, providerHealth, availableAudio } from "../src/chain.js";
+import { resolveStream, providerHealth, providerCooldowns, availableAudio } from "../src/chain.js";
 import { warmFZMovies, fzStats } from "../src/providers/fzmovies.js";
 import { cacheStats } from "../src/cache.js";
 import { streamCacheStats } from "../src/streamcache.js";
@@ -193,7 +193,8 @@ export default async function handler(req: any, res: any) {
       return send(res, 200, {
         ok: true, cluster: CLUSTER, version: VERSION,
         tmdbKeyConfigured: !!process.env.TMDB_API_KEY,
-        providers: providerHealth(), cache: cacheStats(), streamCache: streamCacheStats(), fzmovies: fzStats(),
+        providers: providerHealth(), providerCooldowns: await providerCooldowns(),
+        cache: cacheStats(), streamCache: streamCacheStats(), fzmovies: fzStats(),
         security: securityStats(), redis: await redisHealth(),
       });
     }

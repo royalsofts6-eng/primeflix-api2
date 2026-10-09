@@ -25,6 +25,8 @@ import { fzmovies } from "./providers/fzmovies.js";
 import { tmdb } from "./tmdb.js";
 import type { ProviderFn, ProviderResult } from "./providers/types.js";
 import { NotAvailableError } from "./providers/types.js";
+import { toProviderFailure, type FailureClass } from "./providers/failures.js";
+import { redisCommand } from "./security/redis.js";
 import { resolveStreamCached } from "./streamcache.js";
 
 // ── Stubs (Phase 1b — return null so chain skips them) ───────────────────────
@@ -59,13 +61,17 @@ interface Health {
   lastFailAt: number;
   totalLatencyMs: number;
   samples: number;
+  /** Classification of the most recent classified failure (null if none). */
+  lastClass: FailureClass | null;
+  /** Successful NETWORK/SERVER second-attempt retries. */
+  retries: number;
 }
 
 const health = new Map<string, Health>();
 function h(name: string): Health {
   let x = health.get(name);
   if (!x) {
-    x = { success: 0, fail: 0, consecutiveFails: 0, lastFailAt: 0, totalLatencyMs: 0, samples: 0 };
+    x = { success: 0, fail: 0, consecutiveFails: 0, lastFailAt: 0, totalLatencyMs: 0, samples: 0, lastClass: null, retries: 0 };
     health.set(name, x);
   }
   return x;
@@ -87,11 +93,24 @@ function recordSuccess(name: string, latencyMs: number): void {
   x.samples++;
 }
 
-function recordFail(name: string): void {
+/**
+ * Record a failure. `cls` is the failure classification when the failure
+ * came from a classified ProviderFailure; omitted for plain null-misses
+ * (existing behavior preserved). When this failure just opens the
+ * in-memory circuit, the cooldown is mirrored to Redis so EVERY instance
+ * (api1 + api2) skips the provider — the cross-instance truth.
+ */
+function recordFail(name: string, cls?: FailureClass): void {
   const x = h(name);
+  const wasOpen = circuitOpen(name);
   x.fail++;
   x.consecutiveFails++;
   x.lastFailAt = Date.now();
+  if (cls) x.lastClass = cls;
+  if (!wasOpen && circuitOpen(name) && cls && cls !== "content_miss") {
+    // Fail-open: Redis errors are swallowed inside setProviderCooldown.
+    void setProviderCooldown(name, cls).catch(() => {});
+  }
 }
 
 export function providerHealth(): Record<string, unknown> {
@@ -103,9 +122,90 @@ export function providerHealth(): Record<string, unknown> {
       avgLatencyMs: x.samples ? Math.round(x.totalLatencyMs / x.samples) : null,
       consecutiveFails: x.consecutiveFails,
       circuitOpen: circuitOpen(name),
+      lastFailureClass: x.lastClass,
+      retries: x.retries,
     };
   }
   return out;
+}
+
+// ── Redis provider cooldowns (shared across api1/api2) ─────────────────────
+// Key: pf:cooldown:{provider}:{class}, 5-min TTL. The in-memory circuit
+// breaker above is the fast path; these keys are the cross-instance truth —
+// when one instance cools a provider (429, or 5 consecutive failures),
+// every instance skips it. Fail-open: Redis down -> in-memory only.
+const COOLDOWN_TTL_SEC = 300;
+const COOLDOWN_CLASSES = ["network", "not_found", "forbidden", "rate_limited", "server"];
+
+/** Set a provider cooldown. Never throws (fail-open). */
+export async function setProviderCooldown(
+  provider: string,
+  cls: FailureClass,
+  retryAfterMs?: number
+): Promise<void> {
+  if (cls === "content_miss") return; // never cooled
+  // RATE_LIMITED honors Retry-After as a LOWER bound: the provider asked for
+  // e.g. 120s, so we cool at least that long (min 5 min per the key design).
+  const ttl =
+    cls === "rate_limited" && retryAfterMs
+      ? Math.max(COOLDOWN_TTL_SEC, Math.ceil(retryAfterMs / 1000))
+      : COOLDOWN_TTL_SEC;
+  const value = retryAfterMs ? String(retryAfterMs) : "1";
+  await redisCommand(["SET", `pf:cooldown:${provider}:${cls}`, value, "EX", ttl]).catch(() => null);
+}
+
+const COOLDOWN_CHECK_SCRIPT = `
+local out = {}
+for i = 1, #KEYS do
+  local p = KEYS[i]
+  for _, c in ipairs(ARGV) do
+    if redis.call('EXISTS', 'pf:cooldown:' .. p .. ':' .. c) == 1 then
+      out[#out + 1] = p
+      break
+    end
+  end
+end
+return out
+`;
+
+/**
+ * Providers currently under a Redis cooldown (any class). ONE Lua EVAL for
+ * all names. Fail-open: returns an empty set when Redis is unavailable.
+ */
+export async function redisProviderCooldowns(names: string[]): Promise<Set<string>> {
+  if (names.length === 0) return new Set();
+  try {
+    const r = await redisCommand(["EVAL", COOLDOWN_CHECK_SCRIPT, names.length, ...names, ...COOLDOWN_CLASSES]);
+    if (!Array.isArray(r)) return new Set();
+    return new Set(r.map(String));
+  } catch {
+    return new Set();
+  }
+}
+
+/** All provider names known to the chain (for cooldown checks + /health). */
+export const PROVIDER_NAMES = [
+  "vidlink",
+  "vaplayer",
+  "vidrock",
+  "vidsrc",
+  "screenscape",
+  "vidzee",
+  "fzmovies",
+];
+
+/** Live cooldown list for /health (fail-open). */
+export async function providerCooldowns(): Promise<string[]> {
+  return [...(await redisProviderCooldowns(PROVIDER_NAMES))];
+}
+
+/**
+ * True when a provider must be skipped: in-memory circuit open OR under a
+ * Redis cooldown set by any instance. Fail-open on Redis errors.
+ */
+export async function providerBlocked(name: string): Promise<boolean> {
+  if (circuitOpen(name)) return true;
+  return (await redisProviderCooldowns([name])).has(name);
 }
 
 // ── Chain ───────────────────────────────────────────────────────────────────
@@ -117,20 +217,21 @@ const PROVIDERS: ProviderEntry[] = [
   { name: "screenscape", fn: notYet("screenscape"), stub: true },
 ];
 
-function rankProviders(): ProviderEntry[] {
-  return [...PROVIDERS]
-    .filter((p) => !circuitOpen(p.name))
-    .sort((a, b) => {
-      const ha = h(a.name);
-      const hb = h(b.name);
-      const ra = ha.success + ha.fail ? ha.success / (ha.success + ha.fail) : 0.5;
-      const rb = hb.success + hb.fail ? hb.success / (hb.success + hb.fail) : 0.5;
-      // success rate desc, then avg latency asc
-      if (rb !== ra) return rb - ra;
-      const la = ha.samples ? ha.totalLatencyMs / ha.samples : Infinity;
-      const lb = hb.samples ? hb.totalLatencyMs / hb.samples : Infinity;
-      return la - lb;
-    });
+async function rankProviders(): Promise<ProviderEntry[]> {
+  // Cross-instance truth: skip providers under a Redis cooldown set by ANY
+  // instance (fail-open — Redis down means the in-memory circuit only).
+  const cooled = await redisProviderCooldowns(PROVIDERS.map((p) => p.name));
+  return PROVIDERS.filter((p) => !circuitOpen(p.name) && !cooled.has(p.name)).sort((a, b) => {
+    const ha = h(a.name);
+    const hb = h(b.name);
+    const ra = ha.success + ha.fail ? ha.success / (ha.success + ha.fail) : 0.5;
+    const rb = hb.success + hb.fail ? hb.success / (hb.success + hb.fail) : 0.5;
+    // success rate desc, then avg latency asc
+    if (rb !== ra) return rb - ra;
+    const la = ha.samples ? ha.totalLatencyMs / ha.samples : Infinity;
+    const lb = hb.samples ? hb.totalLatencyMs / hb.samples : Infinity;
+    return la - lb;
+  });
 }
 
 const RACE_COUNT = 3;
@@ -161,8 +262,49 @@ async function tryProvider(
     // correct provider response, NOT a failure. Don't trip the circuit
     // breaker — otherwise 5x "no Hindi" would block Hindi for everyone.
     if (e instanceof NotAvailableError) return null;
-    if (recordStats() && !p.stub) recordFail(p.name);
-    return null;
+    const pf = toProviderFailure(p.name, e);
+    if (pf.cls === "content_miss") return null;
+    // Race losers and stubs: don't count, don't retry, don't cool down.
+    if (!recordStats() || p.stub) return null;
+    switch (pf.cls) {
+      // NOT_FOUND / FORBIDDEN: retry is pointless -> next provider now.
+      case "not_found":
+      case "forbidden":
+        recordFail(p.name, pf.cls);
+        return null;
+      // RATE_LIMITED: no in-request retry. Cool the provider cluster-wide
+      // NOW, honoring Retry-After (min 5 min), so every instance backs off.
+      case "rate_limited":
+        recordFail(p.name, pf.cls);
+        await setProviderCooldown(p.name, "rate_limited", pf.retryAfterMs).catch(() => {});
+        return null;
+      default: {
+        // NETWORK / SERVER: exactly ONE retry, then next provider.
+        // The stats gate is re-checked after the retry: if the race settled
+        // while we retried, this provider lost — don't pollute /health.
+        try {
+          const r2 = await p.fn(tmdbId, type, season, episode);
+          if (r2 && r2.qualities.length > 0) {
+            if (recordStats()) {
+              h(p.name).retries++;
+              recordSuccess(p.name, Date.now() - t0);
+            }
+            return r2;
+          }
+          if (recordStats()) recordFail(p.name, pf.cls);
+          return null;
+        } catch (err2) {
+          const pf2 = toProviderFailure(p.name, err2);
+          if (recordStats()) {
+            recordFail(p.name, pf2.cls);
+            if (pf2.cls === "rate_limited") {
+              await setProviderCooldown(p.name, "rate_limited", pf2.retryAfterMs).catch(() => {});
+            }
+          }
+          return null;
+        }
+      }
+    }
   }
 }
 
@@ -200,7 +342,7 @@ export async function resolveStreamLive(
   // Explicit Hindi request (language switcher): VidZee → FZMovies cache.
   if (audio === "hi") {
     const hindiEntry: ProviderEntry = { name: "vidzee", fn: vidzee };
-    if (!circuitOpen(hindiEntry.name)) {
+    if (!(await providerBlocked(hindiEntry.name))) {
       const hindi = await tryProvider(hindiEntry, tmdbId, type, season, episode);
       if (hindi) {
         return { ...hindi, resolvedBy: hindiEntry.name, latencyMs: Date.now() - t0 };
@@ -215,7 +357,7 @@ export async function resolveStreamLive(
     // Bollywood/Hindi-original titles: VidLink serves the Hindi ORIGINAL, so
     // ?audio=hi is satisfiable even with no dubbed copy (Ali 2026-10-08:
     // Drishyam showed "English" — the original IS Hindi).
-    if ((await originalLanguage(tmdbId, type)) === "hi" && !circuitOpen("vidlink")) {
+    if ((await originalLanguage(tmdbId, type)) === "hi" && !(await providerBlocked("vidlink"))) {
       const vl = await tryProvider({ name: "vidlink", fn: vidlink }, tmdbId, type, season, episode);
       if (vl) {
         return { ...vl, resolvedBy: "vidlink", latencyMs: Date.now() - t0 };
@@ -228,7 +370,7 @@ export async function resolveStreamLive(
 
   const skipHindi = audio === "en";
   const hindiEntry: ProviderEntry = { name: "vidzee", fn: vidzee };
-  if (!skipHindi && !circuitOpen(hindiEntry.name)) {
+  if (!skipHindi && !(await providerBlocked(hindiEntry.name))) {
     // Hindi-first (Ali 2026-10-08): try VidZee Hindi-dubbed before the English chain.
     // VidZee has a short internal fetch timeout (7s) so the 60s budget stays
     // safe; on miss we fall through to FZMovies cache, then chain.
@@ -245,7 +387,7 @@ export async function resolveStreamLive(
     // Cache miss: the English chain serves now; Hindi warms via cron only.
   }
 
-  const ranked = rankProviders();
+  const ranked = await rankProviders();
   if (ranked.length === 0) throw new Error("all providers in cooldown");
 
   const racers = ranked.slice(0, RACE_COUNT);
@@ -409,7 +551,7 @@ export async function availableAudio(
 
     // Parallel: VidZee live check + FZMovies cache check. Either hit = Hindi.
     const checks: Promise<boolean>[] = [];
-    if (!circuitOpen(hindiEntry.name)) {
+    if (!(await providerBlocked(hindiEntry.name))) {
       checks.push(
         (async () => {
           try {

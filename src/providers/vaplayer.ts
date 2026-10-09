@@ -2,11 +2,13 @@
  * VaPlayer provider — direct .m3u8 via streamdata API.
  * Format verified from stremio-addon-streamimdb (2026-04).
  * NOTE: api.php currently 404s (2026-10-08) — endpoint may have moved.
- * Returns null gracefully; chain falls through to next provider.
+ * Throws a classified ProviderFailure on upstream errors (chain.ts handles
+ * per-class: 404 -> next provider immediately, no retry).
  *
  * Needs IMDb ID — resolved from TMDB via imdb_id field.
  */
 import type { ProviderResult, StreamQuality } from "./types.js";
+import { fetchUpstream } from "./failures.js";
 
 const API_URL = process.env.VAPLAYER_API_URL || "https://streamdata.vaplayer.ru/api.php";
 const UA =
@@ -35,30 +37,28 @@ export async function vaplayer(
     params.set("episode", String(episode ?? 1));
   }
 
-  try {
-    const res = await fetch(`${API_URL}?${params}`, {
-      headers: {
-        "User-Agent": UA,
-        Referer: referer,
-        Origin: "https://brightpathsignals.com",
-        Accept: "application/json, text/javascript, */*; q=0.01",
-        "X-Requested-With": "XMLHttpRequest",
-      },
-      signal: AbortSignal.timeout(8000),
-    });
-    if (!res.ok) return null;
-    const body = (await res.json()) as any;
-    const urls: string[] = body?.data?.stream_urls || [];
-    if (!Array.isArray(urls) || urls.length === 0) return null;
+  // Classified fetch: the dead api.php 404s -> NOT_FOUND -> chain moves to
+  // the next provider immediately with no retry. (Chain marks this provider
+  // stub:true, so misses are never counted against the circuit.)
+  const res = await fetchUpstream("vaplayer", `${API_URL}?${params}`, {
+    headers: {
+      "User-Agent": UA,
+      Referer: referer,
+      Origin: "https://brightpathsignals.com",
+      Accept: "application/json, text/javascript, */*; q=0.01",
+      "X-Requested-With": "XMLHttpRequest",
+    },
+    signal: AbortSignal.timeout(8000),
+  });
+  const body = (await res.json()) as any;
+  const urls: string[] = body?.data?.stream_urls || [];
+  if (!Array.isArray(urls) || urls.length === 0) return null;
 
-    const qualities: StreamQuality[] = urls.map((u, i) => ({
-      quality: `source${i + 1}`,
-      url: u,
-      codec: "h264",
-      size: 0,
-    }));
-    return { provider: "vaplayer", qualities };
-  } catch {
-    return null;
-  }
+  const qualities: StreamQuality[] = urls.map((u, i) => ({
+    quality: `source${i + 1}`,
+    url: u,
+    codec: "h264",
+    size: 0,
+  }));
+  return { provider: "vaplayer", qualities };
 }
