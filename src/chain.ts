@@ -151,6 +151,36 @@ export async function setProviderCooldown(
   await redisCommand(["SET", `pf:cooldown:${provider}:${cls}`, value, "EX", ttl]).catch(() => null);
 }
 
+// ── VidLink key-death corroboration (P0-2, refined live 2026-10-09) ─────────
+// A single 200+null body is NOT key-death (live-proven: valid key nulls
+// individual titles it can't serve, e.g. Interstellar/157336, while
+// Matrix/603 streams fine). A DEAD key nulls EVERYTHING — so we count
+// DISTINCT tmdbIds nulling inside a fixed 10-minute bucket and only call
+// it key-death at 3+. An isolated null stays a silent miss (the old,
+// correct behavior). Fail-safe: without Redis we can't corroborate, so we
+// never cool (a lone instance must not take down the English lane).
+const VLNULL_BUCKET_MS = 10 * 60_000;
+const VLNULL_DISTINCT_THRESHOLD = 3;
+
+/**
+ * Record a VidLink null-body for `tmdbId`. Returns true when 3+ distinct
+ * titles nulled inside the current 10-minute bucket — i.e. the key is
+ * (almost certainly) dead. Never throws (fail-safe -> false).
+ */
+async function vidlinkNullCorroborated(tmdbId: string): Promise<boolean> {
+  if (!redisEnabled()) return false;
+  try {
+    const bucket = Math.floor(Date.now() / VLNULL_BUCKET_MS);
+    const k = `pf:vlnull:${bucket}`;
+    await redisCommand(["SADD", k, String(tmdbId)]);
+    await redisCommand(["EXPIRE", k, 1200]);
+    const n = await redisCommand(["SCARD", k]);
+    return Number(n) >= VLNULL_DISTINCT_THRESHOLD;
+  } catch {
+    return false;
+  }
+}
+
 const COOLDOWN_CHECK_SCRIPT = `
 local out = {}
 for i = 1, #KEYS do
@@ -308,21 +338,26 @@ export async function tryProvider(
       return null; // circuit does NOT trip (types.ts)
     }
     if (e instanceof RateLimitedError) return rateLimited(e);
-    // P0-2 (2026-10-09): VidLink key-death — HTTP 200 + literal null body
-    // means the encryption key rotated. This is a server-class FAILURE, not
-    // a miss: cool the provider cluster-wide immediately and count it toward
-    // the circuit, so a dead key stops burning upstream calls within one
-    // lane instead of silently missing forever. Also recorded in a daily
-    // dead-key counter the canary reads (P1-1).
+    // P0-2 (2026-10-09, refined live): VidLink 200+null is the documented
+    // dead-KEY shape — but a valid key also nulls individual titles it
+    // can't serve (Interstellar nulled 3/3 while Matrix streamed on the
+    // same key). So a lone null is a silent miss; only 3+ DISTINCT titles
+    // nulling within 10 min corroborates key-death and cools the provider
+    // cluster-wide (+ circuit count + daily dead-key counter for the
+    // canary). This can never false-positive a whole lane on one title.
     if (e instanceof VidLinkKeyDeadError) {
-      onError("key-death: http 200 + null body");
+      onError(`null body for ${e.tmdbId} (unconfirmed)`);
       if (!signal?.aborted && recordStats() && !p.stub) {
-        recordFail(p.name, "server");
-        await setProviderCooldown(p.name, "server").catch(() => {});
-        const day = new Date().toISOString().slice(0, 10);
-        const kkey = `pf:keydeath:${p.name}:${day}`;
-        await redisCommand(["INCR", kkey]).catch(() => {});
-        await redisCommand(["EXPIRE", kkey, 7 * 24 * 3600]).catch(() => {});
+        const dead = await vidlinkNullCorroborated(e.tmdbId);
+        if (dead) {
+          onError("KEY-DEATH corroborated: 3+ distinct titles nulled in 10 min");
+          recordFail(p.name, "server");
+          await setProviderCooldown(p.name, "server").catch(() => {});
+          const day = new Date().toISOString().slice(0, 10);
+          const kkey = `pf:keydeath:${p.name}:${day}`;
+          await redisCommand(["INCR", kkey]).catch(() => {});
+          await redisCommand(["EXPIRE", kkey, 7 * 24 * 3600]).catch(() => {});
+        }
       }
       return null;
     }

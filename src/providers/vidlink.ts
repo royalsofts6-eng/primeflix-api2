@@ -51,18 +51,24 @@ function parseResponse(data: any): ProviderResult | null {
 }
 
 /**
- * VidLink key-death signal (P0-2, 2026-10-09). The encryption key rotates;
- * the documented symptom (live-verified in the antiblock report §3) is
- * HTTP 200 with a literal `null` body. An EMPTY qualities object is a legit
- * miss ("title unavailable"); a null body is NOT a miss — chain.ts treats
- * this as a server-class failure: immediate cluster-wide cooldown +
- * circuit counting, so a dead key stops burning upstream calls within one
- * lane instead of silently missing forever.
+ * VidLink null-body signal (P0-2, 2026-10-09, refined live 2026-10-09).
+ *
+ * HTTP 200 with a literal `null` body is VidLink's documented DEAD-KEY
+ * shape (antiblock report §3: wrong key -> 200+null, no 401/403). BUT a
+ * live probe on 2026-10-09 proved a VALID key also returns 200+null for
+ * individual titles it can't serve (Interstellar/157336 nulled 3/3 while
+ * Matrix/603 and Shawshank/278 streamed fine on the same key) — so a
+ * single null is NOT key-death. chain.ts corroborates: only 3+ DISTINCT
+ * titles nulling within 10 minutes cools the provider. An isolated null
+ * stays a silent miss, exactly like the old behavior.
  */
 export class VidLinkKeyDeadError extends Error {
-  constructor() {
-    super("vidlink: key-death signal (HTTP 200 + null body)");
+  /** The TMDB id whose lookup returned the null body (for corroboration). */
+  readonly tmdbId: string;
+  constructor(tmdbId: string) {
+    super(`vidlink: null body for ${tmdbId} (possible key-death — needs corroboration)`);
     this.name = "VidLinkKeyDeadError";
+    this.tmdbId = tmdbId;
   }
 }
 
@@ -101,8 +107,10 @@ export async function vidlink(
       : AbortSignal.timeout(8000),
   });
   const data = await res.json();
-  // P0-2 (2026-10-09): the documented key-death signal. parseResponse's
-  // empty-qualities path is for legit misses; a null body is never a miss.
-  if (data === null || data === undefined) throw new VidLinkKeyDeadError();
+  // P0-2 (2026-10-09): null body is the documented dead-KEY shape — but a
+  // valid key also nulls individual titles it can't serve (live-proven),
+  // so this is only a CANDIDATE signal; chain.ts corroborates across
+  // distinct titles before cooling anyone. Empty-qualities stays a miss.
+  if (data === null || data === undefined) throw new VidLinkKeyDeadError(tmdbId);
   return parseResponse(data);
 }
