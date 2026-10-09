@@ -1,5 +1,6 @@
 {
   "dependencies": {
+    "@vercel/functions": "^3.9.11",
     "tweetnacl": "^1.0.3"
   },
   "description": "PrimeFlix API Cluster 2 — TMDB proxy + multi-provider streaming",

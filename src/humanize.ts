@@ -10,10 +10,35 @@
  * scheduling (never :00), randomized gaps between warm titles.
  */
 
-/** Human pause between two sequential wrapper calls: 800–2500ms uniform. */
-export function humanPause(): Promise<void> {
+/**
+ * Human pause between two sequential wrapper calls: 800–2500ms uniform.
+ *
+ * P0-1 (2026-10-09): aborts early when `signal` fires (chain 45s
+ * deadline) instead of sleeping through it — the rejection is the signal's
+ * AbortError, which tryProvider treats as a silent miss.
+ */
+export function humanPause(signal?: AbortSignal): Promise<void> {
   const ms = 800 + Math.random() * 1700;
-  return new Promise((r) => setTimeout(r, ms));
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      try {
+        signal?.throwIfAborted();
+      } catch (e) {
+        reject(e);
+      }
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 /** Gap between two warmed titles in a cron run: 20–60s (browsing a list). */

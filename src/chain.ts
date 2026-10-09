@@ -24,6 +24,7 @@
  * cooldown only, NEVER a circuit failure.
  */
 import { vidlink } from "./providers/vidlink.js";
+import { VidLinkKeyDeadError } from "./providers/vidlink.js";
 import { vidzee } from "./providers/vidzee.js";
 import { fzmovies } from "./providers/fzmovies.js";
 import { moviebox, movieboxHindi, movieboxHindiKnownMissing, movieboxHindiVerdict, movieboxLive, noteMovieboxHindi, wrapperStatus } from "./providers/moviebox.js";
@@ -207,6 +208,31 @@ export async function providerBlocked(name: string): Promise<boolean> {
 }
 
 // ── Lanes ───────────────────────────────────────────────────────────────────
+/**
+ * P0-1 (2026-10-09): hard global deadline for the whole stream-resolution
+ * path (lanes + wrapper tiers). Vercel kills invocations at 60s (maxDuration)
+ * with NO response at all — the app sees a hung connection. The chain throws
+ * ChainDeadlineError at 45s and the route maps it to an honest 504, NEVER a
+ * hang. Best-effort caching is the answer for speed: resolveStreamCached
+ * serves fresh/stale hits BEFORE live resolution, so only genuinely
+ * uncached titles ever run the live path this deadline guards.
+ */
+export const CHAIN_DEADLINE_MS = Math.max(
+  5000,
+  parseInt(process.env.CHAIN_DEADLINE_MS || "45000", 10) || 45000
+);
+
+export class ChainDeadlineError extends Error {
+  readonly elapsedMs: number;
+  constructor(elapsedMs: number) {
+    super(
+      `stream resolution exceeded the ${CHAIN_DEADLINE_MS / 1000}s deadline (${elapsedMs}ms)`
+    );
+    this.name = "ChainDeadlineError";
+    this.elapsedMs = elapsedMs;
+  }
+}
+
 /** Race mode: "speed" (first success wins) or "quality" (best of the lane). */
 export const RACE_MODE: RaceMode =
   process.env.RACE_MODE === "quality" ? "quality" : "speed";
@@ -282,6 +308,24 @@ export async function tryProvider(
       return null; // circuit does NOT trip (types.ts)
     }
     if (e instanceof RateLimitedError) return rateLimited(e);
+    // P0-2 (2026-10-09): VidLink key-death — HTTP 200 + literal null body
+    // means the encryption key rotated. This is a server-class FAILURE, not
+    // a miss: cool the provider cluster-wide immediately and count it toward
+    // the circuit, so a dead key stops burning upstream calls within one
+    // lane instead of silently missing forever. Also recorded in a daily
+    // dead-key counter the canary reads (P1-1).
+    if (e instanceof VidLinkKeyDeadError) {
+      onError("key-death: http 200 + null body");
+      if (!signal?.aborted && recordStats() && !p.stub) {
+        recordFail(p.name, "server");
+        await setProviderCooldown(p.name, "server").catch(() => {});
+        const day = new Date().toISOString().slice(0, 10);
+        const kkey = `pf:keydeath:${p.name}:${day}`;
+        await redisCommand(["INCR", kkey]).catch(() => {});
+        await redisCommand(["EXPIRE", kkey, 7 * 24 * 3600]).catch(() => {});
+      }
+      return null;
+    }
     const msg = e instanceof Error ? e.message : String(e);
     // Pacer congestion: the wrapper tier is serialized — treat as a miss,
     // not a failure (retrying would just queue behind the same congestion).
@@ -364,10 +408,13 @@ async function wrapperTier(
   tmdbId: string,
   type: "movie" | "tv",
   season?: number,
-  episode?: number
+  episode?: number,
+  /** P0-1: the chain's 45s deadline — aborts a congested wrapper tier. */
+  signal?: AbortSignal
 ): Promise<ProviderResult | null> {
+  if (signal?.aborted) return null;
   if (await providerBlocked(name)) return null;
-  return tryProvider({ name, fn }, tmdbId, type, season, episode);
+  return tryProvider({ name, fn }, tmdbId, type, season, episode, () => true, { signal });
 }
 
 /**
@@ -378,7 +425,10 @@ async function wrapperTier(
  * ?audio=en -> L2 English race -> MovieBox-en tier -> aggregated error.
  * omitted   -> Hindi-first: L1 -> MB-hi -> L2 -> MB-en -> aggregated error.
  *
- * Worst case ~17s+wrapper tiers << Vercel maxDuration 60s.
+ * P0-1 (2026-10-09): a hard 45s deadline guards the whole path (lanes +
+ * wrapper tiers). The deadline signal aborts lanes/tiers mid-flight and the
+ * chain throws ChainDeadlineError between tiers — the route maps it to an
+ * honest 504. Worst case can never reach Vercel's 60s hard-kill again.
  */
 export async function resolveStreamLive(
   tmdbId: string,
@@ -391,10 +441,20 @@ export async function resolveStreamLive(
   const alternates: RankedAlternate[] = [];
   const laneErrors: TierError[] = [];
 
+  // P0-1: global 45s deadline. Firing it aborts the current lane/tier via
+  // the signal; the between-tier checks below turn it into the throw.
+  const deadline = new AbortController();
+  const deadlineTimer = setTimeout(() => deadline.abort(), CHAIN_DEADLINE_MS);
+  const dsignal = deadline.signal;
+  const throwIfDeadline = (): void => {
+    if (dsignal.aborted) throw new ChainDeadlineError(Date.now() - t0);
+  };
+
   /** Run one lane; collect runner-ups for the envelope's alternates. */
   const runLane = async (
     lane: TierEntry[],
-    budgetMs: number
+    budgetMs: number,
+    signal: AbortSignal
   ): Promise<ProviderResult | null> => {
     const tr: TierResult = await raceTier(
       lane,
@@ -404,7 +464,7 @@ export async function resolveStreamLive(
       episode,
       tryProvider,
       providerBlocked,
-      { budgetMs, mode: RACE_MODE }
+      { budgetMs, mode: RACE_MODE, parentSignal: signal }
     );
     laneErrors.push(...tr.errors);
     if (tr.result) {
@@ -446,40 +506,56 @@ export async function resolveStreamLive(
     laneErrors.map((x) => `${x.provider}: ${x.reason}`).join(", ");
 
   // Explicit Hindi request: L1 only.
-  if (audio === "hi") {
-    const h1 = await runLane(HINDI_LANE, HINDI_LANE_BUDGET_MS);
-    if (h1) return win(h1);
-    const mb = await wrapperTier("moviebox-hi", movieboxHindi, tmdbId, type, season, episode);
-    if (mb) return win(mb);
-    // Bollywood/Hindi-original titles: VidLink serves the Hindi ORIGINAL, so
-    // ?audio=hi is satisfiable even with no dubbed copy (Ali 2026-10-08:
-    // Drishyam showed "English" — the original IS Hindi).
-    if ((await originalLanguage(tmdbId, type)) === "hi" && !(await providerBlocked("vidlink"))) {
-      const vl = await tryProvider({ name: "vidlink", fn: vidlink }, tmdbId, type, season, episode);
-      if (vl) return win(vl);
-    }
-    throw new Error("hindi dubbed not available");
-  }
-
   // Explicit English request: L2 only.
-  if (audio === "en") {
-    const e1 = await runLane(ENGLISH_LANE, ENGLISH_LANE_BUDGET_MS);
-    if (e1) return win(e1);
-    const mb = await wrapperTier("moviebox", moviebox, tmdbId, type, season, episode);
-    if (mb) return win(mb);
-    throw new Error(`all providers failed (${describeErrors() || "no reason recorded"})`);
-  }
+  // Omitted: Hindi-first across all four sources.
+  // P0-1: the whole dispatch runs under the 45s deadline timer (cleared in
+  // the finally below, whichever lane path wins or throws).
+  try {
+    if (audio === "hi") {
+      const h1 = await runLane(HINDI_LANE, HINDI_LANE_BUDGET_MS, dsignal);
+      if (h1) return win(h1);
+      throwIfDeadline();
+      const mb = await wrapperTier("moviebox-hi", movieboxHindi, tmdbId, type, season, episode, dsignal);
+      if (mb) return win(mb);
+      throwIfDeadline();
+      // Bollywood/Hindi-original titles: VidLink serves the Hindi ORIGINAL, so
+      // ?audio=hi is satisfiable even with no dubbed copy (Ali 2026-10-08:
+      // Drishyam showed "English" — the original IS Hindi).
+      if ((await originalLanguage(tmdbId, type)) === "hi" && !(await providerBlocked("vidlink"))) {
+        const vl = await tryProvider({ name: "vidlink", fn: vidlink }, tmdbId, type, season, episode, () => true, { signal: dsignal });
+        if (vl) return win(vl);
+      }
+      throwIfDeadline();
+      throw new Error("hindi dubbed not available");
+    }
 
-  // Default: Hindi-first across all four sources.
-  const d1 = await runLane(HINDI_LANE, HINDI_LANE_BUDGET_MS);
-  if (d1) return win(d1);
-  const dmb = await wrapperTier("moviebox-hi", movieboxHindi, tmdbId, type, season, episode);
-  if (dmb) return win(dmb);
-  const d2 = await runLane(ENGLISH_LANE, ENGLISH_LANE_BUDGET_MS);
-  if (d2) return win(d2);
-  const dmb2 = await wrapperTier("moviebox", moviebox, tmdbId, type, season, episode);
-  if (dmb2) return win(dmb2);
-  throw new Error(`all providers failed (${describeErrors() || "no reason recorded"})`);
+    if (audio === "en") {
+      const e1 = await runLane(ENGLISH_LANE, ENGLISH_LANE_BUDGET_MS, dsignal);
+      if (e1) return win(e1);
+      throwIfDeadline();
+      const mb = await wrapperTier("moviebox", moviebox, tmdbId, type, season, episode, dsignal);
+      if (mb) return win(mb);
+      throwIfDeadline();
+      throw new Error(`all providers failed (${describeErrors() || "no reason recorded"})`);
+    }
+
+    // Default: Hindi-first across all four sources.
+    const d1 = await runLane(HINDI_LANE, HINDI_LANE_BUDGET_MS, dsignal);
+    if (d1) return win(d1);
+    throwIfDeadline();
+    const dmb = await wrapperTier("moviebox-hi", movieboxHindi, tmdbId, type, season, episode, dsignal);
+    if (dmb) return win(dmb);
+    throwIfDeadline();
+    const d2 = await runLane(ENGLISH_LANE, ENGLISH_LANE_BUDGET_MS, dsignal);
+    if (d2) return win(d2);
+    throwIfDeadline();
+    const dmb2 = await wrapperTier("moviebox", moviebox, tmdbId, type, season, episode, dsignal);
+    if (dmb2) return win(dmb2);
+    throwIfDeadline();
+    throw new Error(`all providers failed (${describeErrors() || "no reason recorded"})`);
+  } finally {
+    clearTimeout(deadlineTimer);
+  }
 }
 
 /**

@@ -50,6 +50,22 @@ function parseResponse(data: any): ProviderResult | null {
   return { provider: "vidlink", qualities, subtitles };
 }
 
+/**
+ * VidLink key-death signal (P0-2, 2026-10-09). The encryption key rotates;
+ * the documented symptom (live-verified in the antiblock report §3) is
+ * HTTP 200 with a literal `null` body. An EMPTY qualities object is a legit
+ * miss ("title unavailable"); a null body is NOT a miss — chain.ts treats
+ * this as a server-class failure: immediate cluster-wide cooldown +
+ * circuit counting, so a dead key stops burning upstream calls within one
+ * lane instead of silently missing forever.
+ */
+export class VidLinkKeyDeadError extends Error {
+  constructor() {
+    super("vidlink: key-death signal (HTTP 200 + null body)");
+    this.name = "VidLinkKeyDeadError";
+  }
+}
+
 const HEADERS = {
   "User-Agent": "Mozilla/5.0 (Linux; Android 14)",
   Origin: "https://vidlink.pro",
@@ -85,5 +101,8 @@ export async function vidlink(
       : AbortSignal.timeout(8000),
   });
   const data = await res.json();
+  // P0-2 (2026-10-09): the documented key-death signal. parseResponse's
+  // empty-qualities path is for legit misses; a null body is never a miss.
+  if (data === null || data === undefined) throw new VidLinkKeyDeadError();
   return parseResponse(data);
 }

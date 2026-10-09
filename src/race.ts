@@ -59,6 +59,13 @@ export interface RaceConfig {
   budgetMs: number;
   /** "speed": first success wins. "quality": collect all, pick best. */
   mode: RaceMode;
+  /**
+   * Global chain deadline signal (P0-1 2026-10-09: 45s). When it fires the
+   * lane settles immediately as a miss — the chain then throws the deadline
+   * error between tiers, so a hung provider can never stretch a request past
+   * the deadline (Vercel hard-kills at 60s with no response at all).
+   */
+  parentSignal?: AbortSignal;
 }
 
 /** Runner for one provider inside a lane (chain.ts's tryProvider). */
@@ -188,6 +195,7 @@ export async function raceTier(
       box.settled = true;
       clearTimeout(timer);
       ctrl.abort(); // slow losers cancelled
+      cfg.parentSignal?.removeEventListener("abort", onParentAbort);
       rstats.aborts++;
       if (r) recordRaceWin(r.provider);
       else rstats.races++;
@@ -199,6 +207,16 @@ export async function raceTier(
       // of whatever arrived (null when nothing did).
       finish(pickBest(successes));
     }, cfg.budgetMs);
+
+    // P0-1: the chain's 45s deadline settles the lane at once (miss), so the
+    // chain can throw the deadline error between tiers instead of burning
+    // wall-clock here.
+    const onParentAbort = (): void => finish(null);
+    if (cfg.parentSignal?.aborted) {
+      onParentAbort();
+      return;
+    }
+    cfg.parentSignal?.addEventListener("abort", onParentAbort, { once: true });
 
     for (const p of racers) {
       const t0 = Date.now();

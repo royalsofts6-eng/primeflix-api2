@@ -1,9 +1,17 @@
 /**
  * VaPlayer provider — direct .m3u8 via streamdata API.
  * Format verified from stremio-addon-streamimdb (2026-04).
- * NOTE: api.php currently 404s (2026-10-08) — endpoint may have moved.
- * Throws a classified ProviderFailure on upstream errors (chain.ts handles
- * per-class: 404 -> next provider immediately, no retry).
+ *
+ * *** DEAD — DO NOT WIRE (live-verified 2026-10-09) ***
+ *   - https://streamdata.vaplayer.ru/api.php?imdb=tt0133093&type=movie
+ *     -> HTTP 404, 0 bytes (endpoint gone; /api on streamdata also 404s)
+ *   - https://vaplayer.ru/ -> HTTP 200 but now serves a "PlayBox - Stream &
+ *     Share Videos" product page, NOT the streamdata JSON API
+ *   - https://brightpathsignals.com/embed/movie/tt0133093 (the documented
+ *     Referer/Origin) -> connection failed
+ * The provider code is kept for reference (VAPLAYER_API_URL env override
+ * exists) but it is NOT in any race lane — wiring a dead endpoint would
+ * only burn the English lane's budget. Re-verify before any future wiring.
  *
  * Needs IMDb ID — resolved from TMDB via imdb_id field.
  */

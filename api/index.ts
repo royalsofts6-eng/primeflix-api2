@@ -5,6 +5,7 @@
 import { tmdb, TTL } from "../src/tmdb.js";
 import {
   resolveStream,
+  ChainDeadlineError,
   providerHealth,
   providerCooldowns,
   cachedAvailableAudio,
@@ -31,7 +32,7 @@ import {
   revokePlain,
 } from "../src/security/plain.js";
 
-const VERSION = "1.1.1";
+const VERSION = "1.2.0";
 const CLUSTER = process.env.CLUSTER_NAME || "api1";
 const PUBLIC_PATHS = new Set(["/", "/health", "/api", "/api/health"]);
 
@@ -517,7 +518,16 @@ export default async function handler(req: any, res: any) {
     const msg = e instanceof Error ? e.message : String(e);
     let code = "UPSTREAM_ERROR";
     let status = 500;
-    if (msg.includes("request body too large")) {
+    let error = msg; // P2-2-style: some errors get a plain-language message
+    if (e instanceof ChainDeadlineError) {
+      // P0-1 (2026-10-09): the 45s chain deadline fired — honest fast
+      // failure instead of a hung connection (Vercel would hard-kill at
+      // 60s with no response at all). The client should retry; a stale
+      // cache entry or the warm cron will usually serve next time.
+      code = "RESOLVE_TIMEOUT";
+      status = 504;
+      error = "Stream search timed out — please try again";
+    } else if (msg.includes("request body too large")) {
       code = "PAYLOAD_TOO_LARGE";
       status = 413;
     } else if (msg.startsWith("invalid ") || msg.includes("invalid tmdb id")) {
@@ -545,6 +555,6 @@ export default async function handler(req: any, res: any) {
       code = "UPSTREAM_ERROR";
       status = upstream >= 400 && upstream < 500 ? upstream : 502;
     }
-    return send(res, status, fail(msg, code));
+    return send(res, status, fail(error, code));
   }
 }

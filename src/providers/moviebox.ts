@@ -267,11 +267,16 @@ async function resolveTitle(tmdbId: string, type: "movie" | "tv"): Promise<{ tit
   };
 }
 
-/** One paced, humanized wrapper call. Never throws for catalog gaps. */
-async function pacedCall<T>(work: () => Promise<T>): Promise<T> {
-  const release = await acquirePace("mb_wrapper"); // max 1 concurrent, 1/5s
+/**
+ * One paced, humanized wrapper call. Never throws for catalog gaps.
+ * P0-1 (2026-10-09): `signal` is the chain's 45s deadline — the pacer
+ * wait AND the human pause both abort early on it (AbortError), so a
+ * congested wrapper tier can never stretch a request past the deadline.
+ */
+async function pacedCall<T>(work: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  const release = await acquirePace("mb_wrapper", signal);
   try {
-    await humanPause(); // 800–2500ms between sequential wrapper calls
+    await humanPause(signal); // 800–2500ms between sequential wrapper calls
     return await work();
   } finally {
     release();
@@ -306,7 +311,7 @@ export const movieboxHindi: ProviderFn = async (tmdbId, type, _s, _e, opts) => {
     if (await negGet(`stream:${hit.id}`)) return null;
     const r = await getStream(hit.id, signal);
     return r ? { ...r, provider: "moviebox-hi" } : null;
-  });
+  }, opts?.signal);
 };
 
 /** L2 English lane's sequential tier (default resource — original audio). */
@@ -336,5 +341,5 @@ export const moviebox: ProviderFn = async (tmdbId, type, _s, _e, opts) => {
     }
     if (await negGet(`stream:${hit.id}`)) return null;
     return getStream(hit.id, signal);
-  });
+  }, opts?.signal);
 };

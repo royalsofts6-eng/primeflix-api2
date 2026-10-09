@@ -59,10 +59,15 @@ function takeToken(key: string): boolean {
  * is available AND no other paced call is in flight (max 1 concurrent).
  * Rejects after ACQUIRE_TIMEOUT_MS — the caller treats it as a miss, never
  * a failure (no circuit impact).
+ *
+ * P0-1 (2026-10-09): when `signal` aborts (the chain's 45s deadline) the
+ * wait throws an AbortError immediately instead of burning up to 15s —
+ * tryProvider already treats a settled AbortError as a silent miss.
  */
-export async function acquirePace(key: string): Promise<() => void> {
+export async function acquirePace(key: string, signal?: AbortSignal): Promise<() => void> {
   const t0 = Date.now();
   while (!takeToken(key)) {
+    if (signal?.aborted) signal.throwIfAborted(); // AbortError, never hangs
     if (Date.now() - t0 > ACQUIRE_TIMEOUT_MS) {
       throw new Error(`pacer: timeout waiting for ${key} token`);
     }
