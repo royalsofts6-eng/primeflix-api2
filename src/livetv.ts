@@ -94,10 +94,11 @@ const CURATED: Channel[] = [
     category: "pk-entertainment",
     country: "pk",
     type: "hls",
-    // P2 2026-10-09: promoted from backup — old primary was empty; this URL
-    // verified live (dearbulut "Star Sports 2 (576p)", same aggregator host
-    // as Star Sports Select 1/2 + Ten Cricket primaries).
-    url: "http://103.151.60.162:2122/play/a00v/index.m3u8?hls",
+    // P1 fix 2026-10-09: removed the Star Sports 2 URL the P2 commit had
+    // wrongly attached here (dearbulut labels it "Star Sports 2 (576p)").
+    // No genuine ATV Pakistan HLS found live (dearbulut/iptv-org dead,
+    // atv.com.pk down, Tamasha needs auth) → honestly pending.
+    url: "",
     fallbacks: [],
     logo: "https://upload.wikimedia.org/wikipedia/en/8/83/Atv_pakistan.PNG",
   },
@@ -514,7 +515,10 @@ const CURATED: Channel[] = [
     category: "sports",
     country: "in",
     type: "hls",
-    url: "",
+    // P1 fix 2026-10-09: moved here from atv-pk (P2 commit had attached it
+    // to the wrong entry). Verified live (dearbulut "Star Sports 2 (576p)",
+    // same aggregator host as Star Sports Select 1/2 + Ten Cricket primaries).
+    url: "http://103.151.60.162:2122/play/a00v/index.m3u8?hls",
     fallbacks: [],
     logo: "https://img10.hotstar.com/image/upload/f_auto/sources/r1/cms/prod/7957/1783000567957-h.jpg",
   },
