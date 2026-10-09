@@ -8,12 +8,16 @@
  * Layer 2 — fixed window (same Redis EVAL, atomic): per-class sustained
  *   rate guard, kept alongside the bucket.
  *
- * Limits (v1.1 — 2026-10-08 429 fix):
- *   /v1/tmdb/*   : 100 req/min per member
- *   /v1/stream/* :  60 req/min per member (was 20 — too low; home load fires
- *                   20-30 checkPlayable calls via /v1/stream/movie/*)
+ * Limits (v1.2 — 2026-10-09 429 flood fix):
+ *   /v1/tmdb/*   : 200 req/min per member
+ *   /v1/stream/* : 120 req/min per member (was 60 — too tight; normal
+ *                   browsing + player re-resolve hits it)
  *   /v1/auth/*   :  10 req/min per IP (brute-force protection)
- *   default      :  60 req/min per member
+ *   default      : 120 req/min per member
+ *
+ * NOTE (v1.2): stream/tmdb/default limits raised to match the token-bucket
+ * burst headroom (120 burst + 2/s refill). Fixed-window was the effective
+ * cap and blocked legitimate users.
  *
  * NOTE: in-memory per instance (serverless). The Redis combined check is
  * tried FIRST (shared across api1/api2); the in-memory bucket is the
@@ -155,16 +159,16 @@ export async function checkRateLimit(pathname: string, identity: string): Promis
   let capacity: number;
   let cls: string;
   if (pathname.startsWith("/v1/stream/")) {
-    capacity = 60;
+    capacity = 120;
     cls = "stream";
   } else if (pathname.startsWith("/v1/tmdb/")) {
-    capacity = 100;
+    capacity = 200;
     cls = "tmdb";
   } else if (pathname.startsWith("/v1/auth/")) {
     capacity = 10;
     cls = "auth";
   } else {
-    capacity = 60;
+    capacity = 120;
     cls = "default";
   }
   // Redis: token bucket + fixed window in ONE atomic EVAL (shared across
