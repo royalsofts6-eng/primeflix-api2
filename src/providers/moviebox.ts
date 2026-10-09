@@ -77,6 +77,48 @@ async function negSet(k: string): Promise<void> {
   }
 }
 
+// ── MovieBox-Hindi language verdict (P1 2026-10-09) ──────────────────────
+// The dub button (/languages) must know about MovieBox Hindi without
+// live-probing the wrapper on every info-screen open. This verdict cache
+// (24h, matching the pf:mbneg catalog-gap cadence) is written "1" when a
+// chain win/alternate or a probe proves MovieBox has Hindi for a title,
+// "0" when a probe proves it doesn't. Cheap Redis read, shared api1+api2.
+// The 6h pf:lang envelope stays the primary throttle — this key only guards
+// the probe path underneath it.
+const MBHILANG_TTL_S = 24 * 3600;
+const mbhilangKey = (tmdbId: string): string => `pf:mbhilang:movie:${tmdbId}`;
+
+/** Record the MovieBox-Hindi verdict for a movie. Never throws. */
+export async function noteMovieboxHindi(tmdbId: string, found: boolean): Promise<void> {
+  if (!redisEnabled()) return;
+  try {
+    await redisCacheSet(mbhilangKey(tmdbId), found ? "1" : "0", MBHILANG_TTL_S);
+  } catch {
+    /* best-effort */
+  }
+}
+
+/** Shared verdict read: true/false, or null when unknown. Never throws. */
+export async function movieboxHindiVerdict(tmdbId: string): Promise<boolean | null> {
+  if (!redisEnabled()) return null;
+  try {
+    const v = await redisCacheGet<string>(mbhilangKey(tmdbId));
+    return v === "1" ? true : v === "0" ? false : null;
+  } catch {
+    return null;
+  }
+}
+
+/** True when a chain run already proved MovieBox has NO Hindi for this movie. */
+export async function movieboxHindiKnownMissing(tmdbId: string): Promise<boolean> {
+  return negGet(`hi:${tmdbId}`);
+}
+
+/** Combined liveness: env flag AND the Redis kill switch. Cheap (one Redis GET). */
+export async function movieboxLive(): Promise<boolean> {
+  return enabled() && (await wrapperAlive());
+}
+
 // ── Title matching (D1 verified algorithm + D4 junk filter) ──────────────────
 const norm = (s: string): string => s.toLowerCase().replace(/[^a-z0-9 ]/g, " ");
 

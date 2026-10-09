@@ -150,6 +150,35 @@ export async function isStreamCachedFresh(
   return !!env && Date.now() < env.freshUntil;
 }
 
+/**
+ * Providers that won (or were ranked alternates in) any cached envelope for
+ * a title — default and Hindi audio keys (P1 2026-10-09). Lets /languages
+ * answer MovieBox-Hindi from chain state with zero wrapper calls. Never
+ * throws (fail-open -> empty set).
+ */
+export async function cachedStreamProviders(
+  type: "movie" | "tv",
+  tmdbId: string,
+  season?: number,
+  episode?: number
+): Promise<Set<string>> {
+  const out = new Set<string>();
+  for (const audio of [undefined, "hi"] as const) {
+    try {
+      const key = streamCacheKey(type, tmdbId, season, episode, audio);
+      const env = await readEnvelope(key, redisKeyFor(key));
+      if (!env) continue;
+      if (env.result?.provider) out.add(env.result.provider);
+      for (const a of env.alternates ?? []) {
+        if (a?.provider) out.add(a.provider);
+      }
+    } catch {
+      /* fail-open */
+    }
+  }
+  return out;
+}
+
 // ── Request coalescing (single-flight) ──────────────────────────────────────
 
 // In-flight live resolutions, keyed by cache key (per-instance dedup).

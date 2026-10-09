@@ -110,6 +110,13 @@ export default async function handler(req: any, res: any) {
       if (req.method !== "GET" && req.method !== "HEAD") {
         gateBody = await readBody(req);
       }
+      // P0 fix (2026-10-09): the gate consumed the request stream — stash
+      // the buffered body on the request so downstream routes (e.g.
+      // POST /v1/stream/report) reuse it instead of re-reading the stream.
+      // Re-attaching data/end listeners to an already-consumed stream never
+      // fires `end` again -> the second readBody() hangs until Vercel's 60s
+      // maxDuration kills the invocation.
+      req.__gateBody = gateBody;
       // Auth is header-only: X-API-Key (day-1) or HMAC headers. The old
       // ?api_key= query fallback is gone — secrets in URLs land in logs.
       const gate = await authGatePlain(req.method || "GET", path, (n) => {
@@ -348,7 +355,11 @@ export default async function handler(req: any, res: any) {
     // itself is gone), and counts per-provider dead signals for canaries.
     // Member-auth via the standard gate (not a public path, not /v1/cron/*).
     if (path === "/v1/stream/report" && req.method === "POST") {
-      const raw = await readBody(req);
+      // P0 fix (2026-10-09): reuse the auth gate's already-read body — the
+      // gate runs on every request that reaches this route (report is not
+      // public/auth/cron), so __gateBody is guaranteed present. Calling
+      // readBody(req) here again would hang forever (consumed stream).
+      const raw = typeof req.__gateBody === "string" ? req.__gateBody : "";
       let b: any;
       try {
         b = JSON.parse(raw || "{}");
@@ -363,6 +374,19 @@ export default async function handler(req: any, res: any) {
       const episode = type === "tv" ? posInt(String(b.episode || "")) || undefined : undefined;
       const rkey = `pf:stream:${streamCacheKey(type, id, season, episode, audio)}`;
       const guardKey = `pf:report:${type}:${id}:${season ?? 0}:${episode ?? 0}:${audio || "def"}`;
+      // Per-provider dead counter FIRST (2026-10-09): the 1/hour guard is
+      // per title+audio, but a second provider dying for the same title
+      // within the hour is still a canary signal worth counting. Provider
+      // names are allowlisted into the key (no injection).
+      const providerName =
+        typeof b.provider === "string" && /^[a-z0-9-]{1,32}$/i.test(b.provider)
+          ? b.provider.toLowerCase()
+          : null;
+      if (providerName) {
+        const day = new Date().toISOString().slice(0, 10);
+        await redisCommand(["INCR", `pf:dead:${providerName}:${day}`]).catch(() => null);
+        await redisCommand(["EXPIRE", `pf:dead:${providerName}:${day}`, 7 * 24 * 3600]).catch(() => null);
+      }
       const guard = await redisCommand(["SET", guardKey, "1", "NX", "EX", 3600]).catch(() => null);
       if (guard !== "OK") {
         return send(res, 200, ok({ evicted: false, reason: "already-reported-this-hour" }));
@@ -370,11 +394,6 @@ export default async function handler(req: any, res: any) {
       await redisCommand(["DEL", rkey]).catch(() => null);
       if (b.reason === "hindi_no_longer_available") {
         await redisCommand(["DEL", `pf:lang:${type}:${id}:${season ?? 0}:${episode ?? 0}`]).catch(() => null);
-      }
-      if (typeof b.provider === "string" && b.provider) {
-        const day = new Date().toISOString().slice(0, 10);
-        await redisCommand(["INCR", `pf:dead:${b.provider}:${day}`]).catch(() => null);
-        await redisCommand(["EXPIRE", `pf:dead:${b.provider}:${day}`, 7 * 24 * 3600]).catch(() => null);
       }
       return send(res, 200, ok({ evicted: true }));
     }

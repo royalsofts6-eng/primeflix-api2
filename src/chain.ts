@@ -26,7 +26,7 @@
 import { vidlink } from "./providers/vidlink.js";
 import { vidzee } from "./providers/vidzee.js";
 import { fzmovies } from "./providers/fzmovies.js";
-import { moviebox, movieboxHindi, wrapperStatus } from "./providers/moviebox.js";
+import { moviebox, movieboxHindi, movieboxHindiKnownMissing, movieboxHindiVerdict, movieboxLive, noteMovieboxHindi, wrapperStatus } from "./providers/moviebox.js";
 import { tmdb } from "./tmdb.js";
 import type { ProviderFn, ProviderResult } from "./providers/types.js";
 import { NotAvailableError } from "./providers/types.js";
@@ -37,7 +37,7 @@ import {
 } from "./providers/failures.js";
 import { redisEnabled, redisCacheGet, redisCacheSet, redisCommand } from "./security/redis.js";
 import { cacheGet, cacheSet } from "./cache.js";
-import { resolveStreamCached } from "./streamcache.js";
+import { cachedStreamProviders, resolveStreamCached } from "./streamcache.js";
 import {
   raceTier,
   rankAlternates,
@@ -423,12 +423,24 @@ export async function resolveStreamLive(
     return tr.result;
   };
 
-  const win = (r: ProviderResult): ChainResult => ({
-    ...r,
-    resolvedBy: r.provider,
-    latencyMs: Date.now() - t0,
-    alternates: rankAlternates(alternates),
-  });
+  const win = (r: ProviderResult): ChainResult => {
+    // P1 (2026-10-09): MovieBox-Hindi language verdict — a moviebox-hi win
+    // (or alternate) proves Hindi exists for this title, so /languages can
+    // later answer from chain state instead of live-probing the wrapper.
+    // Fire-and-forget, best-effort.
+    if (
+      type === "movie" &&
+      (r.provider === "moviebox-hi" || alternates.some((a) => a.provider === "moviebox-hi"))
+    ) {
+      void noteMovieboxHindi(tmdbId, true);
+    }
+    return {
+      ...r,
+      resolvedBy: r.provider,
+      latencyMs: Date.now() - t0,
+      alternates: rankAlternates(alternates),
+    };
+  };
 
   const describeErrors = (): string =>
     laneErrors.map((x) => `${x.provider}: ${x.reason}`).join(", ");
@@ -536,13 +548,57 @@ function labelFor(code: string): string {
 }
 
 /**
+ * MovieBox-Hindi availability for the dub button (P1 2026-10-09).
+ *
+ * Pacer-safe by construction: the shared verdict cache (24h) + the 24h
+ * negative catalog-gap cache + cached chain state (stream envelopes) answer
+ * with ZERO wrapper calls in the common case. The live probe is the LAST
+ * resort and runs the real `movieboxHindi` leg — paced (1 req/5s, max 1
+ * concurrent) and humanized exactly like a chain call. Pacer congestion
+ * (acquire timeout) degrades to "not available": never over-claims, never
+ * stampedes. Skipped entirely when the wrapper is killed/disabled or the
+ * provider is blocked, so the kill switch keeps /languages honest too.
+ * Movies only — the wrapper leg never serves series.
+ */
+async function movieboxHindiAvailable(tmdbId: string): Promise<boolean> {
+  try {
+    if (!(await movieboxLive())) return false;
+    if (await providerBlocked("moviebox-hi")) return false;
+    // 1. Shared verdict cache (written by chain wins and past probes).
+    const verdict = await movieboxHindiVerdict(tmdbId);
+    if (verdict !== null) return verdict;
+    // 2. 24h negative cache written by chain runs (catalog gaps).
+    if (await movieboxHindiKnownMissing(tmdbId)) {
+      await noteMovieboxHindi(tmdbId, false);
+      return false;
+    }
+    // 3. Chain state: any cached envelope (default/Hindi audio keys) whose
+    //    winner or alternates include moviebox-hi proves Hindi played.
+    const providers = await cachedStreamProviders("movie", tmdbId);
+    if (providers.has("moviebox-hi")) {
+      await noteMovieboxHindi(tmdbId, true);
+      return true;
+    }
+    // 4. Last resort: ONE paced live probe; the verdict is cached 24h.
+    const r = await movieboxHindi(tmdbId, "movie");
+    const found = !!(r && r.qualities.length > 0);
+    await noteMovieboxHindi(tmdbId, found);
+    return found;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Available audio languages for a title (Ali 2026-10-08: dub button must show
  * ONLY languages that are actually available, not a hardcoded list — AND it
  * must show the movie's REAL original language, e.g. Hindi for Bollywood).
  *
  * - The original language is ALWAYS available (VidLink serves the original).
  * - "hi" is added when the original is not Hindi AND VidZee has Hindi-dubbed
- *   (fast check, 7s internal timeout) OR the FZMovies cache has it (instant).
+ *   (fast check, 7s internal timeout) OR the FZMovies cache has it (instant)
+ *   OR MovieBox has Hindi (P1 2026-10-09: verdict cache + chain state first,
+ *   one paced live probe as the last resort — movies only).
  * - When the original IS Hindi (e.g. Drishyam), "hi" covers both the original
  *   and any dub — no duplicate entry, no fake "English".
  *
@@ -587,6 +643,12 @@ export async function availableAudio(
         }
       })()
     );
+    // MovieBox-Hindi (P1 2026-10-09): the wrapper leg is movies-only, so
+    // series skip it. Verdict-cache-first + paced live probe as the last
+    // resort — /languages stays honest without raising wrapper call volume.
+    if (type === "movie") {
+      checks.push(movieboxHindiAvailable(tmdbId));
+    }
 
     const results = await Promise.race([
       Promise.all(checks),
