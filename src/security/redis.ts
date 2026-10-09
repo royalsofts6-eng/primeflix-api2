@@ -65,28 +65,96 @@ export async function redisHealth(): Promise<{ enabled: boolean; ok: boolean }> 
   return { enabled: true, ok: r === "PONG" };
 }
 
-// ── Fixed-window rate limiting (atomic via EVAL) ────────────────────────────
-// Script: INCR counter; set TTL on first hit; allow iff count <= limit.
+// ── Combined rate check: token bucket + fixed window, ONE atomic EVAL ──────
+// P1 (2026-10-09): the old fixed-window-only check had the boundary
+// double-burst problem (60 requests in the last second of window N + 60 in
+// the first second of window N+1 = 120 in 2s, every minute). The token bucket
+// (burst 120, refill 2/s per device identity) is continuous — it does not
+// reset at window boundaries — so the double-burst is gone. The per-class
+// fixed window is kept alongside as the sustained-rate guard.
+//
+// KEYS[1] = token bucket hash key, KEYS[2] = fixed-window counter key.
+// ARGV: tb_capacity, tb_refill_per_sec, now_ms, fw_limit, fw_window_sec.
+// Returns {tb_allowed, tb_tokens, tb_reset_sec, tb_retry_sec, fw_allowed, fw_count}.
+// Denied requests consume nothing from either limiter.
 const RATE_SCRIPT = `
-local count = redis.call('INCR', KEYS[1])
-if count == 1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end
-if count > tonumber(ARGV[1]) then return 0 end
-return 1
+local tb = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tb_cap = tonumber(ARGV[1])
+local tb_refill = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local tokens = tonumber(tb[1])
+local ts = tonumber(tb[2])
+if tokens == nil or ts == nil then
+  tokens = tb_cap
+  ts = now
+end
+local elapsed = (now - ts) / 1000
+if elapsed < 0 then elapsed = 0 end
+tokens = math.min(tb_cap, tokens + elapsed * tb_refill)
+local tb_allowed = 0
+local tb_retry = 0
+if tokens >= 1 then
+  tokens = tokens - 1
+  tb_allowed = 1
+else
+  tb_retry = (1 - tokens) / tb_refill
+end
+redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)
+redis.call('EXPIRE', KEYS[1], 180)
+local tb_reset = (tb_cap - tokens) / tb_refill
+
+local fw_allowed = 1
+local fw_count = 0
+if tb_allowed == 1 then
+  fw_count = redis.call('INCR', KEYS[2])
+  if fw_count == 1 then redis.call('EXPIRE', KEYS[2], tonumber(ARGV[5])) end
+  if fw_count > tonumber(ARGV[4]) then fw_allowed = 0 end
+end
+-- NOTE: Redis converts Lua NUMBER replies to integers, which would silently
+-- truncate the fractional token values. Format them as strings so the caller
+-- gets full precision (verified live 2026-10-09).
+local f6 = function(x) return string.format('%.6f', x) end
+return {tb_allowed, f6(tokens), f6(tb_reset), f6(tb_retry), fw_allowed, fw_count}
 `;
 
+export interface RateCheckResult {
+  tbAllowed: boolean;
+  tbRemaining: number;
+  tbResetSec: number;
+  tbRetrySec: number;
+  fwAllowed: boolean;
+  fwCount: number;
+}
+
 /**
- * Returns true if the request is allowed (count within limit), false if
- * rate-limited, null if Redis failed (caller should fall back to in-memory).
+ * Atomic token-bucket + fixed-window check.
+ * Returns null if Redis failed (caller falls back to in-memory).
  */
-export async function redisFixedWindow(
-  key: string,
-  limit: number,
-  windowSec: number
-): Promise<boolean | null> {
-  const r = await redisCommand(["EVAL", RATE_SCRIPT, 1, key, limit, windowSec]);
-  if (r === 1 || r === "1") return true;
-  if (r === 0 || r === "0") return false;
-  return null;
+export async function redisRateCheck(
+  tbKey: string,
+  tbCapacity: number,
+  tbRefillPerSec: number,
+  fwKey: string,
+  fwLimit: number,
+  fwWindowSec: number
+): Promise<RateCheckResult | null> {
+  const r = await redisCommand([
+    "EVAL", RATE_SCRIPT, 2, tbKey, fwKey,
+    tbCapacity, tbRefillPerSec, Date.now(), fwLimit, fwWindowSec,
+  ]);
+  if (!Array.isArray(r) || r.length < 6) return null;
+  const n = (v: unknown): number => {
+    const x = typeof v === "string" ? parseFloat(v) : Number(v);
+    return Number.isFinite(x) ? x : 0;
+  };
+  return {
+    tbAllowed: n(r[0]) === 1,
+    tbRemaining: n(r[1]),
+    tbResetSec: n(r[2]),
+    tbRetrySec: n(r[3]),
+    fwAllowed: n(r[4]) === 1,
+    fwCount: n(r[5]),
+  };
 }
 
 // ── Device registry (atomic check-and-add via EVAL) ─────────────────────────

@@ -84,13 +84,13 @@ const H = 3600_000;
 const D = 24 * H;
 
 export const tmdb = {
-  trendingMovie: (timeWindow = "day") =>
-    tmdbGet("/trending/movie/" + timeWindow, { language: "en-US" }, {
-      cacheKey: `tmdb:trending:movie:${timeWindow}`, ttlMs: 6 * H, staleMs: 7 * D,
+  trendingMovie: (timeWindow = "day", page = "1") =>
+    tmdbGet("/trending/movie/" + timeWindow, { language: "en-US", page }, {
+      cacheKey: `tmdb:trending:movie:${timeWindow}:${page}`, ttlMs: 6 * H, staleMs: 7 * D,
     }),
-  trendingTv: (timeWindow = "day") =>
-    tmdbGet("/trending/tv/" + timeWindow, { language: "en-US" }, {
-      cacheKey: `tmdb:trending:tv:${timeWindow}`, ttlMs: 6 * H, staleMs: 7 * D,
+  trendingTv: (timeWindow = "day", page = "1") =>
+    tmdbGet("/trending/tv/" + timeWindow, { language: "en-US", page }, {
+      cacheKey: `tmdb:trending:tv:${timeWindow}:${page}`, ttlMs: 6 * H, staleMs: 7 * D,
     }),
   movie: (id: string) =>
     tmdbGet(`/movie/${id}`, { language: "en-US", append_to_response: "credits,videos" }, {

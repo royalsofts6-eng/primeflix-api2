@@ -8,7 +8,10 @@
  *
  * Chain (final plan v1.0 — NHD dead, 111Movies unverified, both removed):
  *   1. VidLink  ✅ verified 2026-10-08
- *   2. VaPlayer  (stub — Phase 1b)
+ *   2. VaPlayer  ❌ DEAD — verified live 2026-10-09: streamdata.vaplayer.ru/api.php
+ *      404s, vaplayer.ru pivoted to a "PlayBox" video-upload site, embed host
+ *      unreachable. NOT added to the race (honest report, not forced).
+ *      Stub kept so the chain degrades gracefully if it ever comes back.
  *   3. VidRock   (stub — Phase 1b)
  *   4. VidSrc    (stub — Phase 1b)
  *   5. ScreenScape (stub — Phase 1b)
@@ -22,6 +25,7 @@ import { fzmovies } from "./providers/fzmovies.js";
 import { tmdb } from "./tmdb.js";
 import type { ProviderFn, ProviderResult } from "./providers/types.js";
 import { NotAvailableError } from "./providers/types.js";
+import { resolveStreamCached } from "./streamcache.js";
 
 // ── Stubs (Phase 1b — return null so chain skips them) ───────────────────────
 const notYet = (_name: string): ProviderFn => async () => {
@@ -184,7 +188,7 @@ export interface ChainResult extends ProviderResult {
  *   "en" = English/original only (skips Hindi tiers). Omitted = Hindi-first:
  *   VidZee → FZMovies cache → English race chain.
  */
-export async function resolveStream(
+export async function resolveStreamLive(
   tmdbId: string,
   type: "movie" | "tv",
   season?: number,
@@ -307,6 +311,25 @@ export async function resolveStream(
 
   if (!result) throw new Error("all providers failed");
   return { ...result, resolvedBy: result.provider, latencyMs: Date.now() - t0 };
+}
+
+/**
+ * Cached stream resolution (P1 2026-10-09) — the entry point every caller
+ * uses. Successful resolutions are served from the Redis-shared stream
+ * cache (provider-specific TTLs, stale-while-revalidate) and concurrent
+ * in-flight resolutions for the same title collapse into one upstream
+ * resolve. Only successes are cached — errors always go live.
+ */
+export async function resolveStream(
+  tmdbId: string,
+  type: "movie" | "tv",
+  season?: number,
+  episode?: number,
+  audio?: string
+): Promise<ChainResult> {
+  return resolveStreamCached({ tmdbId, type, season, episode, audio }, () =>
+    resolveStreamLive(tmdbId, type, season, episode, audio)
+  );
 }
 
 /**

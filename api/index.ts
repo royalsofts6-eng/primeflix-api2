@@ -6,6 +6,8 @@ import { tmdb, TTL } from "../src/tmdb.js";
 import { resolveStream, providerHealth, availableAudio } from "../src/chain.js";
 import { warmFZMovies, fzStats } from "../src/providers/fzmovies.js";
 import { cacheStats } from "../src/cache.js";
+import { streamCacheStats } from "../src/streamcache.js";
+import { warmTrendingStreams } from "../src/warm.js";
 import { getSeries, getSeasons, getEpisodesForSerie, getStreamUrl, NIAZI_TTL } from "../src/niazitv.js";
 import { getChannels, refreshChannels, groupByCategory, hideDead, pendingChannels } from "../src/livetv.js";
 import { securityStats } from "../src/security/stats.js";
@@ -105,6 +107,11 @@ export default async function handler(req: any, res: any) {
         if (n === "X-API-Key") return header("X-API-Key");
         return header(n);
       }, clientIp, gateBody, url.search.slice(1));
+      // Standard rate-limit headers on EVERY gated response (allowed AND
+      // denied) — clients can back off before hitting 429.
+      if (gate.rlHeaders) {
+        for (const [k, v] of Object.entries(gate.rlHeaders)) res.setHeader(k, v);
+      }
       if (!gate.ok) {
         if (gate.retryAfter) res.setHeader("Retry-After", String(gate.retryAfter));
         return send(res, gate.status || 401, fail(gate.error || "unauthorized", gate.code || "UNAUTHORIZED"));
@@ -115,13 +122,19 @@ export default async function handler(req: any, res: any) {
     if (path === "/v1/auth/register" && req.method === "POST") {
       const body = await readBody(req);
       const r = await registerPlain(body, clientIp);
-      if (r.status === 429) res.setHeader("Retry-After", "60");
+      if (r.status === 429) {
+        res.setHeader("Retry-After", "60");
+        if (r.rlHeaders) for (const [k, v] of Object.entries(r.rlHeaders)) res.setHeader(k, v);
+      }
       return send(res, r.status, r.json);
     }
     if (path === "/v1/auth/refresh" && req.method === "POST") {
       const body = await readBody(req);
       const r = await refreshPlain(body, clientIp);
-      if (r.status === 429) res.setHeader("Retry-After", "60");
+      if (r.status === 429) {
+        res.setHeader("Retry-After", "60");
+        if (r.rlHeaders) for (const [k, v] of Object.entries(r.rlHeaders)) res.setHeader(k, v);
+      }
       return send(res, r.status, r.json);
     }
     if (path === "/v1/auth/revoke" && req.method === "POST") {
@@ -160,6 +173,7 @@ export default async function handler(req: any, res: any) {
           "GET /v1/livetv/channels",
           "GET /v1/cron/livetv-refresh",
           "GET /v1/cron/fz-warm?tmdbId=",
+          "GET /v1/cron/stream-warm?limit=",
         ],
         // P2-2 (2026-10-08): canonical auth contract. X-PF-Timestamp MUST
         // be unix MILLISECONDS (Date.now()); seconds-epoch values are
@@ -179,7 +193,7 @@ export default async function handler(req: any, res: any) {
       return send(res, 200, {
         ok: true, cluster: CLUSTER, version: VERSION,
         tmdbKeyConfigured: !!process.env.TMDB_API_KEY,
-        providers: providerHealth(), cache: cacheStats(), fzmovies: fzStats(),
+        providers: providerHealth(), cache: cacheStats(), streamCache: streamCacheStats(), fzmovies: fzStats(),
         security: securityStats(), redis: await redisHealth(),
       });
     }
@@ -371,6 +385,23 @@ export default async function handler(req: any, res: any) {
       if (!id) return send(res, 400, fail("tmdbId required (numeric)", "BAD_QUERY"));
       const warm = await warmFZMovies(id, "movie", true);
       return send(res, 200, ok({ tmdbId: id, warmed: warm.warmed, reason: warm.reason, qualities: warm.qualities || 0 }));
+    }
+    // Stream pre-warm (P1 2026-10-09): resolves the top ~200 TMDB trending
+    // titles into the shared stream cache. CRON_SECRET protected,
+    // header-only (same pattern as /v1/cron/fz-warm).
+    // Bounded: a Redis cursor cycles through the list — `limit` titles per
+    // run (default 40, max 60), 4-way concurrency, hard 50s deadline — so the
+    // invocation ALWAYS completes inside Vercel's 60s maxDuration.
+    // Usage: GET /v1/cron/stream-warm?limit=40  (x-cron-secret header)
+    if (path === "/v1/cron/stream-warm") {
+      const secret = header("x-cron-secret");
+      if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+        return send(res, 401, fail("unauthorized", "BAD_CRON_SECRET"));
+      }
+      const rawLimit = parseInt(q.get("limit") || "40", 10);
+      const limit = Math.min(Math.max(Number.isFinite(rawLimit) ? rawLimit : 40, 1), 60);
+      const report = await warmTrendingStreams(limit);
+      return send(res, 200, ok(report));
     }
 
     return send(res, 404, fail("not found", "NOT_FOUND"));

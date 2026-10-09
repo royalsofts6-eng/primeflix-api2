@@ -1,5 +1,12 @@
 /**
- * Token-bucket rate limiting — per member + endpoint class.
+ * Two-layer rate limiting — per member/device + endpoint class.
+ *
+ * Layer 1 — token bucket (Redis Lua, atomic): burst 120, refill 2/sec per
+ *   device identity. Continuous — no window boundaries, so the fixed-window
+ *   boundary double-burst (60 in the last second of window N + 60 in the
+ *   first second of window N+1) is impossible.
+ * Layer 2 — fixed window (same Redis EVAL, atomic): per-class sustained
+ *   rate guard, kept alongside the bucket.
  *
  * Limits (v1.1 — 2026-10-08 429 fix):
  *   /v1/tmdb/*   : 100 req/min per member
@@ -8,11 +15,15 @@
  *   /v1/auth/*   :  10 req/min per IP (brute-force protection)
  *   default      :  60 req/min per member
  *
- * NOTE: in-memory per instance (serverless). Redis-backed fixed-window
- * counters are tried FIRST (shared across api1/api2); the in-memory bucket
- * is the fallback when Redis is unavailable (degrades to best-effort).
+ * NOTE: in-memory per instance (serverless). The Redis combined check is
+ * tried FIRST (shared across api1/api2); the in-memory bucket is the
+ * fallback when Redis is unavailable (degrades to best-effort).
  */
-import { redisEnabled, redisFixedWindow } from "./redis.js";
+import { redisEnabled, redisRateCheck } from "./redis.js";
+
+/** Device-wide burst bucket (P1 2026-10-09). */
+const TB_CAPACITY = 120;
+const TB_REFILL_PER_SEC = 2;
 
 interface Bucket {
   tokens: number;
@@ -21,7 +32,11 @@ interface Bucket {
 
 const buckets = new Map<string, Bucket>();
 
-function bucketFor(key: string, capacity: number, refillPerSec: number): boolean {
+function bucketTake(
+  key: string,
+  capacity: number,
+  refillPerSec: number
+): { ok: boolean; remaining: number; resetSec: number; retryAfterSec: number } {
   const now = Date.now();
   let b = buckets.get(key);
   if (!b) {
@@ -32,9 +47,21 @@ function bucketFor(key: string, capacity: number, refillPerSec: number): boolean
   const elapsed = (now - b.lastRefill) / 1000;
   b.tokens = Math.min(capacity, b.tokens + elapsed * refillPerSec);
   b.lastRefill = now;
-  if (b.tokens < 1) return false; // rate limited
+  if (b.tokens < 1) {
+    return {
+      ok: false,
+      remaining: 0,
+      resetSec: (capacity - b.tokens) / refillPerSec,
+      retryAfterSec: (1 - b.tokens) / refillPerSec,
+    };
+  }
   b.tokens -= 1;
-  return true;
+  return {
+    ok: true,
+    remaining: b.tokens,
+    resetSec: (capacity - b.tokens) / refillPerSec,
+    retryAfterSec: 0,
+  };
 }
 
 // periodic cleanup to bound memory
@@ -60,48 +87,86 @@ function maybeCleanup(): void {
 export interface RateLimit {
   allowed: boolean;
   retryAfterSec?: number;
+  /** RateLimit-Limit / Remaining / Reset header values. */
+  limit?: number;
+  remaining?: number;
+  resetSec?: number;
+}
+
+/** Seconds until the current fixed window rolls over. */
+function windowRetryAfterSec(): number {
+  const nowS = Math.floor(Date.now() / 1000);
+  return Math.max(1, 60 - (nowS % 60));
 }
 
 export async function checkRateLimit(pathname: string, identity: string): Promise<RateLimit> {
   let capacity: number;
-  let perMin: number;
   let cls: string;
   if (pathname.startsWith("/v1/stream/")) {
     capacity = 60;
-    perMin = 60;
     cls = "stream";
   } else if (pathname.startsWith("/v1/tmdb/")) {
     capacity = 100;
-    perMin = 100;
     cls = "tmdb";
   } else if (pathname.startsWith("/v1/auth/")) {
     capacity = 10;
-    perMin = 10;
     cls = "auth";
   } else {
     capacity = 60;
-    perMin = 60;
     cls = "default";
   }
-  // Redis fixed-window (shared across instances) — preferred path.
+  // Redis: token bucket + fixed window in ONE atomic EVAL (shared across
+  // instances). Preferred path.
   if (redisEnabled()) {
     const window = Math.floor(Date.now() / 60_000);
-    const key = `pf:rl:${cls}:${identity}:${window}`;
-    const allowed = await redisFixedWindow(key, capacity, 120);
-    if (allowed === true) return { allowed: true };
-    if (allowed === false) {
-      return { allowed: false, retryAfterSec: Math.ceil(60 / perMin) };
+    const rc = await redisRateCheck(
+      `pf:tb:${identity}`,
+      TB_CAPACITY,
+      TB_REFILL_PER_SEC,
+      `pf:rl:${cls}:${identity}:${window}`,
+      capacity,
+      120
+    );
+    if (rc) {
+      const base = {
+        limit: TB_CAPACITY,
+        remaining: Math.max(0, Math.floor(rc.tbRemaining)),
+        resetSec: Math.max(0, Math.ceil(rc.tbResetSec)),
+      };
+      if (!rc.tbAllowed) {
+        return {
+          allowed: false,
+          retryAfterSec: Math.max(1, Math.ceil(rc.tbRetrySec)),
+          ...base,
+          remaining: 0,
+        };
+      }
+      if (!rc.fwAllowed) {
+        return { allowed: false, retryAfterSec: windowRetryAfterSec(), ...base, remaining: 0 };
+      }
+      return { allowed: true, ...base };
     }
     // null = Redis failed → fall through to in-memory bucket.
   }
   // In-memory token bucket (per-instance fallback).
   maybeCleanup();
   const key = `${pathname.split("/").slice(0, 4).join("/")}:${identity}`;
-  const ok = bucketFor(key, capacity, perMin / 60);
-  if (!ok) {
-    return { allowed: false, retryAfterSec: Math.ceil(60 / perMin) };
+  const b = bucketTake(key, capacity, capacity / 60);
+  if (!b.ok) {
+    return {
+      allowed: false,
+      retryAfterSec: Math.max(1, Math.ceil(b.retryAfterSec)),
+      limit: capacity,
+      remaining: 0,
+      resetSec: Math.max(0, Math.ceil(b.resetSec)),
+    };
   }
-  return { allowed: true };
+  return {
+    allowed: true,
+    limit: capacity,
+    remaining: Math.floor(b.remaining),
+    resetSec: Math.max(0, Math.ceil(b.resetSec)),
+  };
 }
 
 export function rateLimitStats(): { buckets: number } {

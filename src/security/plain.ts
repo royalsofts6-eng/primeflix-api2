@@ -11,7 +11,7 @@ import {
   registerDevice,
   revokeMemberKey,
 } from "./devices.js";
-import { checkRateLimit } from "./ratelimit.js";
+import { checkRateLimit, type RateLimit } from "./ratelimit.js";
 import { deriveDeviceSecretFromRef } from "./hmac.js";
 
 export interface GateResult {
@@ -20,9 +20,22 @@ export interface GateResult {
   code?: string;
   error?: string;
   retryAfter?: number;
+  /** Standard RateLimit-Limit/Remaining/Reset headers for the response. */
+  rlHeaders?: Record<string, string>;
   memberRef?: string;
   deviceId?: string;
   mode?: "apikey" | "hmac";
+}
+
+/** Draft-ietf RateLimit header fields from a rate-limit decision. */
+function rateLimitHeaders(rl: RateLimit): Record<string, string> {
+  const h: Record<string, string> = {};
+  if (rl.limit !== undefined) h["RateLimit-Limit"] = String(rl.limit);
+  if (rl.remaining !== undefined)
+    h["RateLimit-Remaining"] = String(Math.max(0, Math.floor(rl.remaining)));
+  if (rl.resetSec !== undefined)
+    h["RateLimit-Reset"] = String(Math.max(0, Math.ceil(rl.resetSec)));
+  return h;
 }
 
 type HeaderGetter = (name: string) => string | null;
@@ -93,8 +106,8 @@ export async function authGatePlain(
   if (apiKey && gotKey === apiKey) {
     const rl = await checkRateLimit(pathname, devId ? `dev:${devId}` : "apikey");
     if (!rl.allowed)
-      return { ok: false, status: 429, code: "RATE_LIMITED", error: "rate limited", retryAfter: rl.retryAfterSec };
-    return { ok: true, mode: "apikey" };
+      return { ok: false, status: 429, code: "RATE_LIMITED", error: "rate limited", retryAfter: rl.retryAfterSec, rlHeaders: rateLimitHeaders(rl) };
+    return { ok: true, mode: "apikey", rlHeaders: rateLimitHeaders(rl) };
   }
 
   // ── Mode 2: HMAC signed request ──
@@ -110,16 +123,16 @@ export async function authGatePlain(
   }
   const rl = await checkRateLimit(pathname, devId ? `dev:${devId}` : (check.memberRef || "unknown"));
   if (!rl.allowed) {
-    return { ok: false, status: 429, code: "RATE_LIMITED", error: "rate limited", retryAfter: rl.retryAfterSec };
+    return { ok: false, status: 429, code: "RATE_LIMITED", error: "rate limited", retryAfter: rl.retryAfterSec, rlHeaders: rateLimitHeaders(rl) };
   }
-  return { ok: true, mode: "hmac", memberRef: check.memberRef, deviceId: check.deviceId };
+  return { ok: true, mode: "hmac", memberRef: check.memberRef, deviceId: check.deviceId, rlHeaders: rateLimitHeaders(rl) };
 }
 
 /** POST /v1/auth/register */
-export async function registerPlain(bodyText: string, clientIp: string): Promise<{ status: number; json: unknown }> {
+export async function registerPlain(bodyText: string, clientIp: string): Promise<{ status: number; json: unknown; rlHeaders?: Record<string, string> }> {
   const rl = await checkRateLimit("/v1/auth/register", `ip:${clientIp}`);
   if (!rl.allowed)
-    return { status: 429, json: { success: false, error: "rate limited", code: "RATE_LIMITED" } };
+    return { status: 429, json: { success: false, error: "rate limited", code: "RATE_LIMITED" }, rlHeaders: rateLimitHeaders(rl) };
   let body: { memberKey?: string; deviceId?: string };
   try {
     body = JSON.parse(bodyText || "{}");
@@ -149,10 +162,10 @@ export async function registerPlain(bodyText: string, clientIp: string): Promise
 
 /** POST /v1/auth/refresh — rate-limited by IP (a stolen token must not be
  *  refreshable at machine speed; refresh also re-checks revocation). */
-export async function refreshPlain(bodyText: string, clientIp: string): Promise<{ status: number; json: unknown }> {
+export async function refreshPlain(bodyText: string, clientIp: string): Promise<{ status: number; json: unknown; rlHeaders?: Record<string, string> }> {
   const rl = await checkRateLimit("/v1/auth/refresh", `ip:${clientIp}`);
   if (!rl.allowed)
-    return { status: 429, json: { success: false, error: "rate limited", code: "RATE_LIMITED" } };
+    return { status: 429, json: { success: false, error: "rate limited", code: "RATE_LIMITED" }, rlHeaders: rateLimitHeaders(rl) };
   let body: { token?: string };
   try {
     body = JSON.parse(bodyText || "{}");
