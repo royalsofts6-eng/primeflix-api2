@@ -1,39 +1,45 @@
 /**
- * Stream resolution cache (P1 — 2026-10-09): Redis-shared,
+ * Stream resolution cache (P1 — 2026-10-09, envelope v2 2026-10-09): Redis-shared,
  * stale-while-revalidate, request coalescing.
  *
  * Every successful resolveStream() result is cached under
  *   pf:stream:{type}:{tmdbId}:{season}:{episode}:{audio}
- * with provider-specific fresh TTLs:
- *   VidLink 2h · VidZee 30min · FZMovies 10h (existing) · default 30min
+ * as envelope v2: { v: 2, result, alternates[<=3], freshUntil, staleUntil }
+ * (1 key, 1 read — the app fails over client-side across alternates with
+ * zero new backend round-trip).
+ *
+ * Provider-specific fresh TTLs (seconds):
+ *   VidZee 2h (token lifetime 180min verified — the old 30m re-resolved 4x
+ *     too often) · VidLink 2h · FZMovies 10h · MovieBox wrapper 1h
+ *     (conservative, expiry unverified) · default 30m
  * plus a 15-minute stale-while-revalidate window.
  *
  * Read path: Redis (shared api1+api2) → in-memory (per-instance) → live.
  *
- * Stale hit: served instantly + fire-and-forget background revalidate.
- *   Best-effort on serverless — the invocation may freeze after the
- *   response ends, so a revalidate is not guaranteed to complete. The
- *   bounded 15min stale window guarantees a sync re-resolve at worst, and
- *   the nightly /v1/cron/stream-warm keeps hot titles fresh.
+ * Stale hit: served instantly + background revalidate via waitUntil when
+ * available (best-effort on serverless — falls back to fire-and-forget).
  *
  * Coalescing: concurrent in-flight resolutions for the same key collapse
  * into one upstream resolve — in-memory promise map per instance, plus a
- * Redis lock with bounded polling cross-instance (thundering herd → 1
- * upstream resolve; waiters share the winner's result).
+ * Redis lock with bounded polling cross-instance.
  *
  * Only successes are cached. Errors ("all providers failed",
  * "hindi dubbed not available") are NEVER cached.
  */
 import { redisEnabled, redisCacheGet, redisCacheSet, redisCommand } from "./security/redis.js";
 import { cacheGet, cacheSet } from "./cache.js";
+import { background } from "./revalidate.js";
 import type { ChainResult } from "./chain.js";
+import type { RankedAlternate } from "./race.js";
 
 // Provider-specific fresh TTLs (seconds). Ordered by the CEO 2026-10-09.
 const TTL_BY_PROVIDER: Record<string, number> = {
   vidlink: 2 * 3600,
-  vidzee: 30 * 60,
+  vidzee: 2 * 3600,
   fzmovies: 10 * 3600,
   vaplayer: 3600,
+  moviebox: 3600,
+  "moviebox-hi": 3600,
 };
 const DEFAULT_TTL_S = 30 * 60;
 /** Stale-while-revalidate window (seconds) — bounded. */
@@ -61,8 +67,11 @@ export interface StreamArgs {
 }
 
 interface StreamCacheEnvelope {
-  v: 1;
+  v: 2;
+  /** Winner (alternates stripped — they live in `alternates`). */
   result: ChainResult;
+  /** Ranked runner-ups, best-first (max 3) — client-side failover. */
+  alternates: RankedAlternate[];
   freshUntil: number; // epoch ms
   staleUntil: number; // epoch ms
 }
@@ -90,10 +99,11 @@ const redisKeyFor = (key: string): string => `pf:stream:${key}`;
 
 async function readEnvelope(key: string, rkey: string): Promise<StreamCacheEnvelope | null> {
   // Redis first (shared api1+api2 — one warm benefits both clusters),
-  // then per-instance memory.
+  // then per-instance memory. v1 envelopes are ignored (graceful: they
+  // simply re-resolve and are rewritten as v2 — no migration needed).
   if (redisEnabled()) {
     const rhit = await redisCacheGet<StreamCacheEnvelope>(rkey);
-    if (rhit && rhit.v === 1 && rhit.result?.qualities?.length) {
+    if (rhit && rhit.v === 2 && rhit.result?.qualities?.length) {
       // Backfill local memory with the remaining lifetime.
       const now = Date.now();
       const freshMs = Math.max(0, rhit.freshUntil - now);
@@ -104,7 +114,7 @@ async function readEnvelope(key: string, rkey: string): Promise<StreamCacheEnvel
     }
   }
   const hit = cacheGet<StreamCacheEnvelope>(key);
-  if (hit && hit.value.v === 1 && hit.value.result?.qualities?.length) return hit.value;
+  if (hit && hit.value.v === 2 && hit.value.result?.qualities?.length) return hit.value;
   return null;
 }
 
@@ -112,9 +122,11 @@ async function writeEnvelope(key: string, rkey: string, result: ChainResult): Pr
   if (!result?.qualities?.length) return; // never cache empty/failed results
   const ttlS = TTL_BY_PROVIDER[result.provider] ?? DEFAULT_TTL_S;
   const now = Date.now();
+  const { alternates, ...rest } = result;
   const env: StreamCacheEnvelope = {
-    v: 1,
-    result,
+    v: 2,
+    result: { ...rest, alternates: [] },
+    alternates: (alternates ?? []).slice(0, 3),
     freshUntil: now + ttlS * 1000,
     staleUntil: now + (ttlS + STALE_WINDOW_S) * 1000,
   };
@@ -151,8 +163,8 @@ async function pollForResult(rkey: string): Promise<ChainResult | null> {
   while (Date.now() - start < COALESCE_POLL_MS) {
     await sleep(COALESCE_POLL_INTERVAL_MS);
     const env = await redisCacheGet<StreamCacheEnvelope>(rkey);
-    if (env && env.v === 1 && env.result?.qualities?.length && Date.now() < env.freshUntil) {
-      return env.result;
+    if (env && env.v === 2 && env.result?.qualities?.length && Date.now() < env.freshUntil) {
+      return { ...env.result, alternates: env.alternates ?? [] };
     }
   }
   return null;
@@ -208,22 +220,28 @@ async function resolveLiveSingleflight(
   }
 }
 
-/** Fire-and-forget revalidation for stale hits (never throws). */
+/**
+ * Background revalidation for stale hits (never throws). Uses Vercel
+ * waitUntil when available so the revalidate actually completes after the
+ * response ends; falls back to fire-and-forget otherwise.
+ */
 function revalidateSoon(
   key: string,
   rkey: string,
   live: () => Promise<ChainResult>
 ): void {
-  void (async (): Promise<void> => {
-    try {
-      // Goes through the same single-flight path, so concurrent stale
-      // requests trigger exactly one background re-resolve per instance.
-      await resolveLiveSingleflight(key, rkey, live);
-    } catch {
-      // Keep serving stale — the bounded stale window guarantees a sync
-      // re-resolve at worst, and the nightly cron refreshes hot titles.
-    }
-  })();
+  background(
+    (async (): Promise<void> => {
+      try {
+        // Goes through the same single-flight path, so concurrent stale
+        // requests trigger exactly one background re-resolve per instance.
+        await resolveLiveSingleflight(key, rkey, live);
+      } catch {
+        // Keep serving stale — the bounded stale window guarantees a sync
+        // re-resolve at worst, and the cron refreshes hot titles.
+      }
+    })()
+  );
 }
 
 // ── Public entry point ──────────────────────────────────────────────────────
@@ -243,12 +261,12 @@ export async function resolveStreamCached(
   if (env) {
     if (now < env.freshUntil) {
       stats.hits++;
-      return env.result;
+      return { ...env.result, alternates: env.alternates ?? [] };
     }
     if (now < env.staleUntil) {
       stats.stale++;
       revalidateSoon(key, rkey, live);
-      return env.result;
+      return { ...env.result, alternates: env.alternates ?? [] };
     }
   }
   stats.misses++;

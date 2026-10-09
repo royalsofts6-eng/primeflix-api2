@@ -4,6 +4,10 @@
  * TMDB rate limit is PER-IP (40 req / 10s), shared across all Vercel
  * customers on the same egress IPs. Caching is the ONLY real mitigation.
  *
+ * Two cache layers: in-memory L1 (per instance) + Redis L2 `pf:tmdb:*`
+ * (shared api1+api2 — cold invocations read the shared cache instead of
+ * stampeding TMDB; this was the warm-cron cold-start stampede).
+ *
  * TTLs (from final plan v1.0):
  *   trending/home : 6h  (+ 7d stale)
  *   details       : 24h (+ 7d stale)
@@ -13,6 +17,7 @@
  * If TMDB fails and stale cache exists -> serve stale (never blank).
  */
 import { cacheGet, cacheSet } from "./cache.js";
+import { redisEnabled, redisCacheGet, redisCacheSet } from "./security/redis.js";
 
 const TMDB = "https://api.themoviedb.org/3";
 
@@ -31,6 +36,17 @@ export interface TmdbFetchOpts {
 async function tmdbGet(path: string, params: Record<string, string>, opts: TmdbFetchOpts): Promise<unknown> {
   const cached = cacheGet<unknown>(opts.cacheKey);
   if (cached && !cached.stale) return cached.value;
+
+  // Redis L2 (shared api1+api2): a cold instance reads the shared entry
+  // instead of hitting TMDB. Backfills memory L1 on hit.
+  const rkey = `pf:tmdb:${opts.cacheKey}`;
+  if (redisEnabled()) {
+    const rhit = await redisCacheGet<unknown>(rkey).catch(() => null);
+    if (rhit) {
+      cacheSet(opts.cacheKey, rhit, opts.ttlMs, opts.staleMs);
+      return rhit;
+    }
+  }
 
   // Single-flight: concurrent requests for the same cache key share ONE
   // upstream fetch. TMDB is 40 req/10s per IP shared across all Vercel
@@ -63,11 +79,20 @@ async function tmdbGet(path: string, params: Record<string, string>, opts: TmdbF
       if (!res.ok) throw new Error(`TMDB HTTP ${res.status}`);
       const data = await res.json();
       cacheSet(opts.cacheKey, data, opts.ttlMs, opts.staleMs);
+      // Fan out to Redis so every instance (and both clusters) shares it.
+      if (redisEnabled()) {
+        await redisCacheSet(rkey, data, Math.floor(opts.ttlMs / 1000)).catch(() => {});
+      }
       return data;
     } catch (e) {
-      // Serve stale on failure (C4: never blank screen)
+      // Serve stale on failure (C4: never blank screen) — memory first,
+      // then the shared Redis copy.
       const stale = cacheGet<unknown>(opts.cacheKey);
       if (stale) return stale.value;
+      if (redisEnabled()) {
+        const rhit = await redisCacheGet<unknown>(rkey).catch(() => null);
+        if (rhit) return rhit;
+      }
       throw e;
     } finally {
       inflight.delete(opts.cacheKey);

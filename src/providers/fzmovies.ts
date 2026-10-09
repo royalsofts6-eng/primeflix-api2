@@ -402,6 +402,16 @@ export async function warmFZMovies(
   const key = cacheKey(tmdbId);
   const existing = cacheGet<ProviderResult>(key);
   if (existing) return { warmed: true, reason: "cached", qualities: existing.value.qualities.length };
+  // Redis check FIRST (2026-10-09 fix): cold invocations have empty memory —
+  // without this, an already-warm Redis entry triggers a pointless 35–60s
+  // re-scrape. 1 command saves up to 60s of upstream.
+  if (redisEnabled()) {
+    const rhit = await redisCacheGet<ProviderResult>(key).catch(() => null);
+    if (rhit?.qualities?.length) {
+      cacheSet(key, rhit, CACHE_TTL_MS, 0); // backfill local memory
+      return { warmed: true, reason: "cached", qualities: rhit.qualities.length };
+    }
+  }
   if (warming.has(key)) return { warmed: false, reason: "already-warming" };
   warming.add(key);
   try {

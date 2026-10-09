@@ -55,6 +55,18 @@ export type FailureClass =
   | "server"
   | "content_miss";
 
+/**
+ * HTTP 429 — back off cluster-wide via the Redis cooldown. This is NEVER a
+ * circuit failure: a rate-limited provider is healthy but asking us to slow
+ * down, so it must not count toward the 5-consecutive-fails circuit.
+ */
+export class RateLimitedError extends ProviderFailure {
+  constructor(provider: string, message: string, retryAfterMs?: number) {
+    super(provider, "rate_limited", message, { status: 429, retryAfterMs });
+    this.name = "RateLimitedError";
+  }
+}
+
 /** Map an HTTP status to its failure class. */
 export function classifyStatus(status: number): FailureClass {
   if (status === 404) return "not_found";
@@ -154,14 +166,18 @@ export async function fetchUpstream(
     );
   }
   const cls = classifyStatus(res.status);
+  if (cls === "rate_limited") {
+    throw new RateLimitedError(
+      provider,
+      `${provider}: http 429 for ${shortUrl(url)}`,
+      parseRetryAfterMs(res.headers)
+    );
+  }
   throw new ProviderFailure(
     provider,
     cls,
     `${provider}: http ${res.status} for ${shortUrl(url)}`,
-    {
-      status: res.status,
-      retryAfterMs: cls === "rate_limited" ? parseRetryAfterMs(res.headers) : undefined,
-    }
+    { status: res.status }
   );
 }
 

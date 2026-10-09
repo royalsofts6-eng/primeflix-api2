@@ -3,11 +3,20 @@
  * Uniform contract: { success: true, data } | { success: false, error, code }
  */
 import { tmdb, TTL } from "../src/tmdb.js";
-import { resolveStream, providerHealth, providerCooldowns, availableAudio } from "../src/chain.js";
+import {
+  resolveStream,
+  providerHealth,
+  providerCooldowns,
+  cachedAvailableAudio,
+  wrapperStatus,
+  RACE_MODE,
+} from "../src/chain.js";
+import { raceStats } from "../src/race.js";
 import { warmFZMovies, fzStats } from "../src/providers/fzmovies.js";
 import { cacheStats } from "../src/cache.js";
-import { streamCacheStats } from "../src/streamcache.js";
-import { warmTrendingStreams } from "../src/warm.js";
+import { streamCacheStats, streamCacheKey } from "../src/streamcache.js";
+import { warmTrendingStreams, warmFZMoviesBatch } from "../src/warm.js";
+import { redisCommand } from "../src/security/redis.js";
 import { getSeries, getSeasons, getEpisodesForSerie, getStreamUrl, NIAZI_TTL } from "../src/niazitv.js";
 import { getChannels, refreshChannels, groupByCategory, hideDead, pendingChannels } from "../src/livetv.js";
 import { securityStats } from "../src/security/stats.js";
@@ -163,6 +172,8 @@ export default async function handler(req: any, res: any) {
           "GET /v1/stream/movie/:tmdbId/languages",
           "GET /v1/stream/tv/:tmdbId/:season/:episode/languages",
           "GET /v1/stream/tv/:tmdbId/:season/:episode",
+          "POST /v1/stream/report",
+          "GET /v1/cron/fz-warm-batch?limit=",
           "POST /v1/auth/register",
           "POST /v1/auth/refresh",
           "POST /v1/auth/revoke",
@@ -190,11 +201,18 @@ export default async function handler(req: any, res: any) {
     }
 
     if (path === "/health") {
+      const sc = streamCacheStats();
+      const total = sc.hits + sc.misses;
       return send(res, 200, {
         ok: true, cluster: CLUSTER, version: VERSION,
         tmdbKeyConfigured: !!process.env.TMDB_API_KEY,
+        // 4-source parallel system (2026-10-09)
+        raceMode: RACE_MODE,
+        race: raceStats(),
+        moviebox: await wrapperStatus(),
+        streamCacheHitRate: total ? +(sc.hits / total).toFixed(3) : null,
         providers: providerHealth(), providerCooldowns: await providerCooldowns(),
-        cache: cacheStats(), streamCache: streamCacheStats(), fzmovies: fzStats(),
+        cache: cacheStats(), streamCache: sc, fzmovies: fzStats(),
         security: securityStats(), redis: await redisHealth(),
       });
     }
@@ -279,10 +297,13 @@ export default async function handler(req: any, res: any) {
     // Returns { audio, original, playing, labels }; `audio` stays top-level
     // for backward compat with older apps.
     // MUST sit before the /v1/stream/movie/:tmdbId regex below.
+    // Available audio languages — cached 6h (pf:lang:*) instead of a live
+    // VidZee check on every call (2026-10-09: was the biggest per-request
+    // waste). MUST sit before the /v1/stream/movie/:tmdbId regex below.
     if ((m = path.match(/^\/v1\/stream\/movie\/([^/]+)\/languages$/))) {
       const id = tmdbId(m[1]);
       if (!id) return send(res, 400, fail("invalid tmdb id", "BAD_QUERY"));
-      const info = await availableAudio(id, "movie");
+      const info = await cachedAvailableAudio(id, "movie");
       return send(res, 200, ok({ audio: info.audio, original: info.original, playing: info.playing, labels: info.labels }), { "Cache-Control": "no-store" });
     }
     if ((m = path.match(/^\/v1\/stream\/tv\/([^/]+)\/([^/]+)\/([^/]+)\/languages$/))) {
@@ -293,7 +314,7 @@ export default async function handler(req: any, res: any) {
       if (season === null || episode === null || season > MAX_SEASON || episode > MAX_EPISODE) {
         return send(res, 400, fail("invalid season/episode (expected season 1-100, episode 1-500)", "BAD_QUERY"));
       }
-      const info = await availableAudio(id, "tv", season, episode);
+      const info = await cachedAvailableAudio(id, "tv", season, episode);
       return send(res, 200, ok({ audio: info.audio, original: info.original, playing: info.playing, labels: info.labels }), { "Cache-Control": "no-store" });
     }
 
@@ -319,6 +340,43 @@ export default async function handler(req: any, res: any) {
       if (audio === null) return;
       const data = await resolveStream(id, "tv", season, episode, audio);
       return send(res, 200, ok(data), { "Cache-Control": "no-store" });
+    }
+
+    // Dead-URL report (2026-10-09): the app calls this when every quality
+    // AND every alternate failed playback. Guarded 1/hour/key (abuse +
+    // duplicate storms), evicts the whole envelope (+ pf:lang when the dub
+    // itself is gone), and counts per-provider dead signals for canaries.
+    // Member-auth via the standard gate (not a public path, not /v1/cron/*).
+    if (path === "/v1/stream/report" && req.method === "POST") {
+      const raw = await readBody(req);
+      let b: any;
+      try {
+        b = JSON.parse(raw || "{}");
+      } catch {
+        return send(res, 400, fail("invalid JSON body", "BAD_QUERY"));
+      }
+      const type = b.type === "tv" ? "tv" : "movie";
+      const id = tmdbId(String(b.tmdbId || ""));
+      if (!id) return send(res, 400, fail("tmdbId required (numeric)", "BAD_QUERY"));
+      const audio = b.audio === "hi" || b.audio === "en" ? b.audio : undefined;
+      const season = type === "tv" ? posInt(String(b.season || "")) || undefined : undefined;
+      const episode = type === "tv" ? posInt(String(b.episode || "")) || undefined : undefined;
+      const rkey = `pf:stream:${streamCacheKey(type, id, season, episode, audio)}`;
+      const guardKey = `pf:report:${type}:${id}:${season ?? 0}:${episode ?? 0}:${audio || "def"}`;
+      const guard = await redisCommand(["SET", guardKey, "1", "NX", "EX", 3600]).catch(() => null);
+      if (guard !== "OK") {
+        return send(res, 200, ok({ evicted: false, reason: "already-reported-this-hour" }));
+      }
+      await redisCommand(["DEL", rkey]).catch(() => null);
+      if (b.reason === "hindi_no_longer_available") {
+        await redisCommand(["DEL", `pf:lang:${type}:${id}:${season ?? 0}:${episode ?? 0}`]).catch(() => null);
+      }
+      if (typeof b.provider === "string" && b.provider) {
+        const day = new Date().toISOString().slice(0, 10);
+        await redisCommand(["INCR", `pf:dead:${b.provider}:${day}`]).catch(() => null);
+        await redisCommand(["EXPIRE", `pf:dead:${b.provider}:${day}`, 7 * 24 * 3600]).catch(() => null);
+      }
+      return send(res, 200, ok({ evicted: true }));
     }
 
     // NiaziTV Turkish dramas (stream URLs NEVER cached — signed/expiring)
@@ -402,6 +460,21 @@ export default async function handler(req: any, res: any) {
       const rawLimit = parseInt(q.get("limit") || "40", 10);
       const limit = Math.min(Math.max(Number.isFinite(rawLimit) ? rawLimit : 40, 1), 60);
       const report = await warmTrendingStreams(limit);
+      return send(res, 200, ok(report));
+    }
+
+    // FZMovies batch warm (2026-10-09): cursor-based top-200 movie cycle for
+    // the cache-only FZMovies Hindi tier. CRON_SECRET protected, header-only.
+    // Called every 4h from a Hatch cron (api1 only — Redis is shared).
+    // Usage: GET /v1/cron/fz-warm-batch?limit=8  (x-cron-secret header)
+    if (path === "/v1/cron/fz-warm-batch") {
+      const secret = header("x-cron-secret");
+      if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+        return send(res, 401, fail("unauthorized", "BAD_CRON_SECRET"));
+      }
+      const rawLimit = parseInt(q.get("limit") || "8", 10);
+      const limit = Math.min(Math.max(Number.isFinite(rawLimit) ? rawLimit : 8, 1), 20);
+      const report = await warmFZMoviesBatch(limit);
       return send(res, 200, ok(report));
     }
 

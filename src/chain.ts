@@ -1,57 +1,54 @@
 /**
- * 5-provider chain with PARALLEL racing + circuit breaker + health tracking.
+ * 4-source parallel chain with LANGUAGE LANES + circuit breaker + health.
  *
- * CRITICAL: Vercel maxDuration is 60s (verified 2026-10-08 on both clusters).
- * Sequentially trying 5 providers would exceed it. We race the top-3
- * healthiest providers in parallel with an 8s overall budget and take the
- * first success.
+ * Architecture (Ali 2026-10-09 — 4-source parallel system):
+ *   L0 stream cache (streamcache.ts, unchanged)
+ *   miss -> L1 HINDI LANE (8s): vidzee + fzmovies — PARALLEL, first wins
+ *   miss -> MovieBox-hi SEQUENTIAL tier (cyber rule: wrapper leg NEVER in a
+ *           race — paced 1 req/5s, max 1 concurrent, kill-switched)
+ *   miss -> L2 ENGLISH LANE (8s): vidlink
+ *   miss -> MovieBox-en SEQUENTIAL tier
+ *   miss -> honest error (never cached)
  *
- * Chain (final plan v1.0 — NHD dead, 111Movies unverified, both removed):
- *   1. VidLink  ✅ verified 2026-10-08
- *   2. VaPlayer  ❌ DEAD — verified live 2026-10-09: streamdata.vaplayer.ru/api.php
- *      404s, vaplayer.ru pivoted to a "PlayBox" video-upload site, embed host
- *      unreachable. NOT added to the race (honest report, not forced).
- *      Stub kept so the chain degrades gracefully if it ever comes back.
- *   3. VidRock   (stub — Phase 1b)
- *   4. VidSrc    (stub — Phase 1b)
- *   5. ScreenScape (stub — Phase 1b)
+ * Why lanes, not one flat race: a flat race lets VidLink English (~1-2s)
+ * beat VidZee Hindi (~3s) on titles that HAVE Hindi — Hindi-first breaks.
+ * Lanes = language protection; INSIDE a lane every source is equal and
+ * parallel (no backup hierarchy).
  *
- * Circuit breaker: 5 consecutive fails -> 5 min cooldown.
+ * ?audio=hi -> L1 only (+ Bollywood-original VidLink check, then honest
+ *   "hindi dubbed not available" — no silent English fallback).
+ * ?audio=en -> L2 only. Omitted -> Hindi-first: L1 -> MB-hi -> L2 -> MB-en.
+ *
+ * Circuit breaker: 5 consecutive fails -> 5 min cooldown (in-memory fast
+ * path + Redis cross-instance mirror). 429s are RateLimitedError — Redis
+ * cooldown only, NEVER a circuit failure.
  */
 import { vidlink } from "./providers/vidlink.js";
-import { vaplayer } from "./providers/vaplayer.js";
 import { vidzee } from "./providers/vidzee.js";
 import { fzmovies } from "./providers/fzmovies.js";
+import { moviebox, movieboxHindi, wrapperStatus } from "./providers/moviebox.js";
 import { tmdb } from "./tmdb.js";
 import type { ProviderFn, ProviderResult } from "./providers/types.js";
 import { NotAvailableError } from "./providers/types.js";
-import { toProviderFailure, type FailureClass } from "./providers/failures.js";
-import { redisCommand } from "./security/redis.js";
+import {
+  toProviderFailure,
+  RateLimitedError,
+  type FailureClass,
+} from "./providers/failures.js";
+import { redisEnabled, redisCacheGet, redisCacheSet, redisCommand } from "./security/redis.js";
+import { cacheGet, cacheSet } from "./cache.js";
 import { resolveStreamCached } from "./streamcache.js";
-
-// ── Stubs (Phase 1b — return null so chain skips them) ───────────────────────
-const notYet = (_name: string): ProviderFn => async () => {
-  return null;
-};
-
-/** VaPlayer needs IMDb ID — resolve from TMDB (cached 24h). */
-const vaplayerWithImdb: ProviderFn = async (tmdbId, type, season, episode) => {
-  try {
-    const details = (await (type === "movie" ? tmdb.movie(tmdbId) : tmdb.tv(tmdbId))) as any;
-    const imdbId: string | undefined = details?.imdb_id;
-    if (!imdbId) return null;
-    return vaplayer(tmdbId, type, season, episode, imdbId);
-  } catch {
-    return null;
-  }
-};
-
-interface ProviderEntry {
-  name: string;
-  fn: ProviderFn;
-  /** Unimplemented providers: "no result" is not a failure — don't trip circuits. */
-  stub?: boolean;
-}
+import {
+  raceTier,
+  rankAlternates,
+  type RaceMode,
+  type RaceOpts,
+  type RankedAlternate,
+  type TierEntry,
+  type TierError,
+  type TierResult,
+} from "./race.js";
+import { background } from "./revalidate.js";
 
 // ── Health tracking ─────────────────────────────────────────────────────────
 interface Health {
@@ -95,10 +92,9 @@ function recordSuccess(name: string, latencyMs: number): void {
 
 /**
  * Record a failure. `cls` is the failure classification when the failure
- * came from a classified ProviderFailure; omitted for plain null-misses
- * (existing behavior preserved). When this failure just opens the
- * in-memory circuit, the cooldown is mirrored to Redis so EVERY instance
- * (api1 + api2) skips the provider — the cross-instance truth.
+ * came from a classified ProviderFailure; omitted for plain null-misses.
+ * When this failure just opens the in-memory circuit, the cooldown is
+ * mirrored to Redis so EVERY instance (api1 + api2) skips the provider.
  */
 function recordFail(name: string, cls?: FailureClass): void {
   const x = h(name);
@@ -192,6 +188,8 @@ export const PROVIDER_NAMES = [
   "screenscape",
   "vidzee",
   "fzmovies",
+  "moviebox",
+  "moviebox-hi",
 ];
 
 /** Live cooldown list for /health (fail-open). */
@@ -208,82 +206,112 @@ export async function providerBlocked(name: string): Promise<boolean> {
   return (await redisProviderCooldowns([name])).has(name);
 }
 
-// ── Chain ───────────────────────────────────────────────────────────────────
-const PROVIDERS: ProviderEntry[] = [
-  { name: "vidlink", fn: vidlink },
-  { name: "vaplayer", fn: vaplayerWithImdb, stub: true },
-  { name: "vidrock", fn: notYet("vidrock"), stub: true },
-  { name: "vidsrc", fn: notYet("vidsrc"), stub: true },
-  { name: "screenscape", fn: notYet("screenscape"), stub: true },
+// ── Lanes ───────────────────────────────────────────────────────────────────
+/** Race mode: "speed" (first success wins) or "quality" (best of the lane). */
+export const RACE_MODE: RaceMode =
+  process.env.RACE_MODE === "quality" ? "quality" : "speed";
+
+const HINDI_LANE_BUDGET_MS = 8000;
+const ENGLISH_LANE_BUDGET_MS = 8000;
+
+/** L1 — Hindi lane: every source EQUAL, parallel, first success wins. */
+const HINDI_LANE: TierEntry[] = [
+  { name: "vidzee", fn: vidzee, audio: "hi" },
+  { name: "fzmovies", fn: fzmovies, audio: "hi" }, // cache-only — race me "free"
 ];
 
-async function rankProviders(): Promise<ProviderEntry[]> {
-  // Cross-instance truth: skip providers under a Redis cooldown set by ANY
-  // instance (fail-open — Redis down means the in-memory circuit only).
-  const cooled = await redisProviderCooldowns(PROVIDERS.map((p) => p.name));
-  return PROVIDERS.filter((p) => !circuitOpen(p.name) && !cooled.has(p.name)).sort((a, b) => {
-    const ha = h(a.name);
-    const hb = h(b.name);
-    const ra = ha.success + ha.fail ? ha.success / (ha.success + ha.fail) : 0.5;
-    const rb = hb.success + hb.fail ? hb.success / (hb.success + hb.fail) : 0.5;
-    // success rate desc, then avg latency asc
-    if (rb !== ra) return rb - ra;
-    const la = ha.samples ? ha.totalLatencyMs / ha.samples : Infinity;
-    const lb = hb.samples ? hb.totalLatencyMs / hb.samples : Infinity;
-    return la - lb;
-  });
-}
+/** L2 — English lane. */
+const ENGLISH_LANE: TierEntry[] = [{ name: "vidlink", fn: vidlink }];
 
-const RACE_COUNT = 3;
-const OVERALL_BUDGET_MS = 8000;
-
-async function tryProvider(
-  p: ProviderEntry,
+/**
+ * One provider attempt inside a lane (race.ts's TryOneFn).
+ *
+ * Abort fix (2026-10-09): a loser aborted by the lane settles as a SILENT
+ * null — no fail count, no retry, no circuit. The retry path carries the
+ * race signal (the old code forgot it, so aborted losers retried).
+ * Miss (null) is not a failure. 429 (RateLimitedError) cools the provider
+ * cluster-wide but never touches the circuit.
+ */
+export async function tryProvider(
+  p: TierEntry,
   tmdbId: string,
   type: "movie" | "tv",
   season?: number,
   episode?: number,
-  /** When false, skip health recording (race losers that finished after
-   *  the winner was returned must not pollute provider stats). */
-  recordStats: () => boolean = () => true
+  recordStats: () => boolean = () => true,
+  raceOpts?: RaceOpts
 ): Promise<ProviderResult | null> {
   const t0 = Date.now();
-  const ok = (r: ProviderResult | null): ProviderResult | null => {
-    if (recordStats()) {
-      if (r && r.qualities.length > 0) recordSuccess(p.name, Date.now() - t0);
-      else if (!p.stub) recordFail(p.name);
-    }
-    return r && r.qualities.length > 0 ? r : null;
+  const signal = raceOpts?.signal;
+  const onError = (reason: string): void => {
+    if (raceOpts?.onError) raceOpts.onError(p.name, reason);
+  };
+  const fail = (reason: string): null => {
+    onError(reason);
+    if (recordStats() && !p.stub) recordFail(p.name);
+    return null;
+  };
+  /** 429 handling shared by the first attempt and the retry path. */
+  const rateLimited = async (e: RateLimitedError): Promise<null> => {
+    // Cluster-wide backoff via Redis cooldown. NEVER a circuit failure —
+    // the provider is healthy, just asking us to slow down. lastClass is
+    // still recorded for /health observability.
+    if (recordStats()) h(p.name).lastClass = "rate_limited";
+    await setProviderCooldown(p.name, "rate_limited", e.retryAfterMs).catch(() => {});
+    onError(`http 429${e.retryAfterMs ? ` (retry-after ${e.retryAfterMs}ms)` : ""}`);
+    return null;
   };
   try {
-    return ok(await p.fn(tmdbId, type, season, episode));
+    const r = await p.fn(tmdbId, type, season, episode, { signal });
+    if (signal?.aborted) return null;
+    if (r && r.qualities.length > 0) {
+      if (recordStats()) recordSuccess(p.name, Date.now() - t0);
+      return r;
+    }
+    onError("miss: no qualities");
+    return null; // miss is NOT a failure
   } catch (e) {
-    // "Not available" (e.g. VidZee 404/502 = no Hindi for this title) is a
-    // correct provider response, NOT a failure. Don't trip the circuit
-    // breaker — otherwise 5x "no Hindi" would block Hindi for everyone.
-    if (e instanceof NotAvailableError) return null;
+    // Loser abort: expected, invisible. (raceTier's ctrl.abort() makes
+    // in-flight fetches reject with AbortError.)
+    if (signal?.aborted || (e as Error)?.name === "AbortError") {
+      onError("aborted (lost race)");
+      return null;
+    }
+    if (e instanceof NotAvailableError) {
+      onError("not-available");
+      return null; // circuit does NOT trip (types.ts)
+    }
+    if (e instanceof RateLimitedError) return rateLimited(e);
+    const msg = e instanceof Error ? e.message : String(e);
+    // Pacer congestion: the wrapper tier is serialized — treat as a miss,
+    // not a failure (retrying would just queue behind the same congestion).
+    if (/^pacer: timeout/.test(msg)) {
+      onError("pacer timeout");
+      return null;
+    }
     const pf = toProviderFailure(p.name, e);
-    if (pf.cls === "content_miss") return null;
-    // Race losers and stubs: don't count, don't retry, don't cool down.
+    if (pf.cls === "content_miss") {
+      onError("content-miss");
+      return null;
+    }
     if (!recordStats() || p.stub) return null;
     switch (pf.cls) {
       // NOT_FOUND / FORBIDDEN: retry is pointless -> next provider now.
       case "not_found":
       case "forbidden":
-        recordFail(p.name, pf.cls);
-        return null;
-      // RATE_LIMITED: no in-request retry. Cool the provider cluster-wide
-      // NOW, honoring Retry-After (min 5 min), so every instance backs off.
+        return fail(`http ${pf.status ?? pf.cls}`);
+      // RATE_LIMITED: no in-request retry, no circuit. Cool cluster-wide.
       case "rate_limited":
-        recordFail(p.name, pf.cls);
-        await setProviderCooldown(p.name, "rate_limited", pf.retryAfterMs).catch(() => {});
-        return null;
+        return rateLimited(
+          new RateLimitedError(p.name, pf.message, pf.retryAfterMs)
+        );
       default: {
-        // NETWORK / SERVER: exactly ONE retry, then next provider.
-        // The stats gate is re-checked after the retry: if the race settled
-        // while we retried, this provider lost — don't pollute /health.
+        // NETWORK / SERVER: exactly ONE retry — WITH the race signal
+        // (the old code forgot it), and never when the lane settled.
+        if (signal?.aborted) return null;
         try {
-          const r2 = await p.fn(tmdbId, type, season, episode);
+          const r2 = await p.fn(tmdbId, type, season, episode, { signal });
+          if (signal?.aborted) return null;
           if (r2 && r2.qualities.length > 0) {
             if (recordStats()) {
               h(p.name).retries++;
@@ -291,16 +319,25 @@ async function tryProvider(
             }
             return r2;
           }
-          if (recordStats()) recordFail(p.name, pf.cls);
-          return null;
+          return fail("retry: no qualities");
         } catch (err2) {
+          if (signal?.aborted || (err2 as Error)?.name === "AbortError") return null;
+          if (err2 instanceof RateLimitedError) return rateLimited(err2);
           const pf2 = toProviderFailure(p.name, err2);
+          if (pf2.cls === "content_miss") {
+            onError("content-miss");
+            return null;
+          }
+          if (pf2.cls === "rate_limited") {
+            return rateLimited(
+              new RateLimitedError(p.name, pf2.message, pf2.retryAfterMs)
+            );
+          }
           if (recordStats()) {
             recordFail(p.name, pf2.cls);
-            if (pf2.cls === "rate_limited") {
-              await setProviderCooldown(p.name, "rate_limited", pf2.retryAfterMs).catch(() => {});
-            }
+            // (rate_limited handled above — never reaches recordFail)
           }
+          onError(pf2.message);
           return null;
         }
       }
@@ -308,27 +345,40 @@ async function tryProvider(
   }
 }
 
+// ── Chain ───────────────────────────────────────────────────────────────────
 export interface ChainResult extends ProviderResult {
   resolvedBy: string;
   latencyMs: number;
+  /** Runner-up results for client-side failover (envelope v2). */
+  alternates: RankedAlternate[];
 }
 
 /**
- * Resolve a stream. Races the top-3 healthiest providers in parallel,
- * returns the first success within the overall budget.
+ * Sequential MovieBox wrapper tier — CYBER RULE: the wrapper leg is NEVER
+ * in a race. The provider itself paces (1 req/5s, max 1 concurrent) and
+ * humanizes (800–2500ms gaps); the kill switch bypasses instantly.
+ */
+async function wrapperTier(
+  name: "moviebox-hi" | "moviebox",
+  fn: ProviderFn,
+  tmdbId: string,
+  type: "movie" | "tv",
+  season?: number,
+  episode?: number
+): Promise<ProviderResult | null> {
+  if (await providerBlocked(name)) return null;
+  return tryProvider({ name, fn }, tmdbId, type, season, episode);
+}
+
+/**
+ * Resolve a stream through the language lanes.
  *
- * Hindi chain (Ali 2026-10-08): VidZee → FZMovies → (VidLink English).
- * FZMovies is a PROPER Hindi tier, not a backup. Its 4-hop scrape takes
- * 35-60s, so the request path only reads its cache; warming happens ONLY via
- * /v1/cron/fz-warm (bounded to the 60s maxDuration). Fire-and-forget
- * "background" warming was removed — it cannot complete on serverless.
+ * ?audio=hi -> L1 Hindi race -> MovieBox-hi tier -> (Bollywood-original
+ *   VidLink) -> honest "hindi dubbed not available" (no silent fallback).
+ * ?audio=en -> L2 English race -> MovieBox-en tier -> aggregated error.
+ * omitted   -> Hindi-first: L1 -> MB-hi -> L2 -> MB-en -> aggregated error.
  *
- * @param audio "hi" = Hindi (VidZee → FZMovies cache → VidLink when the
- *   original language itself is Hindi, e.g. Bollywood titles; throws
- *   HINDI_UNAVAILABLE when missing — no silent fallback so the app can show
- *   an honest message).
- *   "en" = English/original only (skips Hindi tiers). Omitted = Hindi-first:
- *   VidZee → FZMovies cache → English race chain.
+ * Worst case ~17s+wrapper tiers << Vercel maxDuration 60s.
  */
 export async function resolveStreamLive(
   tmdbId: string,
@@ -338,129 +388,95 @@ export async function resolveStreamLive(
   audio?: string
 ): Promise<ChainResult> {
   const t0 = Date.now();
+  const alternates: RankedAlternate[] = [];
+  const laneErrors: TierError[] = [];
 
-  // Explicit Hindi request (language switcher): VidZee → FZMovies cache.
-  if (audio === "hi") {
-    const hindiEntry: ProviderEntry = { name: "vidzee", fn: vidzee };
-    if (!(await providerBlocked(hindiEntry.name))) {
-      const hindi = await tryProvider(hindiEntry, tmdbId, type, season, episode);
-      if (hindi) {
-        return { ...hindi, resolvedBy: hindiEntry.name, latencyMs: Date.now() - t0 };
+  /** Run one lane; collect runner-ups for the envelope's alternates. */
+  const runLane = async (
+    lane: TierEntry[],
+    budgetMs: number
+  ): Promise<ProviderResult | null> => {
+    const tr: TierResult = await raceTier(
+      lane,
+      tmdbId,
+      type,
+      season,
+      episode,
+      tryProvider,
+      providerBlocked,
+      { budgetMs, mode: RACE_MODE }
+    );
+    laneErrors.push(...tr.errors);
+    if (tr.result) {
+      for (const s of tr.successes) {
+        if (s.result === tr.result) continue; // the winner isn't its own alternate
+        alternates.push({
+          provider: s.result.provider,
+          audio: s.entry.audio || "en",
+          qualities: s.result.qualities,
+          subtitles: s.result.subtitles,
+          cookie: s.result.cookie,
+          latencyMs: s.latencyMs,
+        });
       }
     }
-    // FZMovies Hindi tier (cache-only in request path — never blocks).
-    const fzEntry: ProviderEntry = { name: "fzmovies", fn: fzmovies };
-    const fz = await tryProvider(fzEntry, tmdbId, type, season, episode);
-    if (fz) {
-      return { ...fz, resolvedBy: fzEntry.name, latencyMs: Date.now() - t0 };
-    }
+    return tr.result;
+  };
+
+  const win = (r: ProviderResult): ChainResult => ({
+    ...r,
+    resolvedBy: r.provider,
+    latencyMs: Date.now() - t0,
+    alternates: rankAlternates(alternates),
+  });
+
+  const describeErrors = (): string =>
+    laneErrors.map((x) => `${x.provider}: ${x.reason}`).join(", ");
+
+  // Explicit Hindi request: L1 only.
+  if (audio === "hi") {
+    const h1 = await runLane(HINDI_LANE, HINDI_LANE_BUDGET_MS);
+    if (h1) return win(h1);
+    const mb = await wrapperTier("moviebox-hi", movieboxHindi, tmdbId, type, season, episode);
+    if (mb) return win(mb);
     // Bollywood/Hindi-original titles: VidLink serves the Hindi ORIGINAL, so
     // ?audio=hi is satisfiable even with no dubbed copy (Ali 2026-10-08:
     // Drishyam showed "English" — the original IS Hindi).
     if ((await originalLanguage(tmdbId, type)) === "hi" && !(await providerBlocked("vidlink"))) {
       const vl = await tryProvider({ name: "vidlink", fn: vidlink }, tmdbId, type, season, episode);
-      if (vl) {
-        return { ...vl, resolvedBy: "vidlink", latencyMs: Date.now() - t0 };
-      }
+      if (vl) return win(vl);
     }
-    // Miss: honest error now. The title can be warmed via /v1/cron/fz-warm
-    // (request-path background warming cannot complete on serverless).
     throw new Error("hindi dubbed not available");
   }
 
-  const skipHindi = audio === "en";
-  const hindiEntry: ProviderEntry = { name: "vidzee", fn: vidzee };
-  if (!skipHindi && !(await providerBlocked(hindiEntry.name))) {
-    // Hindi-first (Ali 2026-10-08): try VidZee Hindi-dubbed before the English chain.
-    // VidZee has a short internal fetch timeout (7s) so the 60s budget stays
-    // safe; on miss we fall through to FZMovies cache, then chain.
-    const hindi = await tryProvider(hindiEntry, tmdbId, type, season, episode);
-    if (hindi) {
-      return { ...hindi, resolvedBy: hindiEntry.name, latencyMs: Date.now() - t0 };
-    }
-    // FZMovies Hindi tier (cache-only — instant).
-    const fzEntry: ProviderEntry = { name: "fzmovies", fn: fzmovies };
-    const fz = await tryProvider(fzEntry, tmdbId, type, season, episode);
-    if (fz) {
-      return { ...fz, resolvedBy: fzEntry.name, latencyMs: Date.now() - t0 };
-    }
-    // Cache miss: the English chain serves now; Hindi warms via cron only.
+  // Explicit English request: L2 only.
+  if (audio === "en") {
+    const e1 = await runLane(ENGLISH_LANE, ENGLISH_LANE_BUDGET_MS);
+    if (e1) return win(e1);
+    const mb = await wrapperTier("moviebox", moviebox, tmdbId, type, season, episode);
+    if (mb) return win(mb);
+    throw new Error(`all providers failed (${describeErrors() || "no reason recorded"})`);
   }
 
-  const ranked = await rankProviders();
-  if (ranked.length === 0) throw new Error("all providers in cooldown");
-
-  const racers = ranked.slice(0, RACE_COUNT);
-  const rest = ranked.slice(RACE_COUNT);
-
-  // Stats gate: providers that finish AFTER the race settled (timeout or a
-  // faster winner) must not record success/fail — their numbers describe a
-  // request the user never saw and skew /health rankings.
-  const raceBox = { settled: false };
-  const gate = () => !raceBox.settled;
-
-  const attempt = async (list: ProviderEntry[]): Promise<ProviderResult | null> => {
-    // True race: resolve on the FIRST success, not when the slowest racer
-    // finishes. Losers keep running but their stats are dropped by the gate.
-    return new Promise((resolve) => {
-      let pending = list.length;
-      let done = false;
-      for (const p of list) {
-        tryProvider(p, tmdbId, type, season, episode, gate).then((r) => {
-          if (done) return;
-          if (r) {
-            done = true;
-            resolve(r);
-          } else if (--pending === 0) {
-            done = true;
-            resolve(null);
-          }
-        });
-      }
-      if (list.length === 0) resolve(null);
-    });
-  };
-
-  // Round 1: race top-3 in parallel with overall budget
-  const winner = await Promise.race([
-    attempt(racers).then((r) => {
-      raceBox.settled = true;
-      return r;
-    }),
-    new Promise<null>((res) =>
-      setTimeout(() => {
-        raceBox.settled = true;
-        res(null);
-      }, OVERALL_BUDGET_MS)
-    ),
-  ]);
-
-  let result = winner;
-  // Round 2: if round 1 failed, try the rest sequentially. Each provider is
-  // capped by the REMAINING overall budget — the old code only checked the
-  // budget *between* providers, so one slow provider could blow past it.
-  if (!result) {
-    for (const p of rest) {
-      const remaining = OVERALL_BUDGET_MS + 1500 - (Date.now() - t0);
-      if (remaining <= 0) break;
-      result = await Promise.race([
-        tryProvider(p, tmdbId, type, season, episode),
-        new Promise<null>((res) => setTimeout(() => res(null), Math.min(remaining, 9000))),
-      ]);
-      if (result) break;
-    }
-  }
-
-  if (!result) throw new Error("all providers failed");
-  return { ...result, resolvedBy: result.provider, latencyMs: Date.now() - t0 };
+  // Default: Hindi-first across all four sources.
+  const d1 = await runLane(HINDI_LANE, HINDI_LANE_BUDGET_MS);
+  if (d1) return win(d1);
+  const dmb = await wrapperTier("moviebox-hi", movieboxHindi, tmdbId, type, season, episode);
+  if (dmb) return win(dmb);
+  const d2 = await runLane(ENGLISH_LANE, ENGLISH_LANE_BUDGET_MS);
+  if (d2) return win(d2);
+  const dmb2 = await wrapperTier("moviebox", moviebox, tmdbId, type, season, episode);
+  if (dmb2) return win(dmb2);
+  throw new Error(`all providers failed (${describeErrors() || "no reason recorded"})`);
 }
 
 /**
- * Cached stream resolution (P1 2026-10-09) — the entry point every caller
- * uses. Successful resolutions are served from the Redis-shared stream
- * cache (provider-specific TTLs, stale-while-revalidate) and concurrent
- * in-flight resolutions for the same title collapse into one upstream
- * resolve. Only successes are cached — errors always go live.
+ * Cached stream resolution — the entry point every caller uses.
+ * Successful resolutions are served from the Redis-shared stream cache
+ * (envelope v2: winner + alternates, provider-specific TTLs,
+ * stale-while-revalidate) and concurrent in-flight resolutions for the same
+ * title collapse into one upstream resolve. Only successes are cached —
+ * errors always go live.
  */
 export async function resolveStream(
   tmdbId: string,
@@ -526,14 +542,11 @@ function labelFor(code: string): string {
  *
  * - The original language is ALWAYS available (VidLink serves the original).
  * - "hi" is added when the original is not Hindi AND VidZee has Hindi-dubbed
- *   (fast check, 3.5s internal timeout) OR the FZMovies cache has it (instant
- *   memory lookup).
+ *   (fast check, 7s internal timeout) OR the FZMovies cache has it (instant).
  * - When the original IS Hindi (e.g. Drishyam), "hi" covers both the original
  *   and any dub — no duplicate entry, no fake "English".
  *
  * Budget: ~8s max — fits the Vercel 60s window with room to spare.
- * Returns e.g. { original: "hi", audio: ["hi"], playing: "hi" } for Drishyam,
- * or { original: "en", audio: ["hi", "en"], playing: "hi" } for Avengers.
  */
 export async function availableAudio(
   tmdbId: string,
@@ -546,8 +559,8 @@ export async function availableAudio(
   // Hindi-dub check only matters when the original is not already Hindi.
   let hindiDub = original === "hi";
   if (!hindiDub) {
-    const hindiEntry: ProviderEntry = { name: "vidzee", fn: vidzee };
-    const fzEntry: ProviderEntry = { name: "fzmovies", fn: fzmovies };
+    const hindiEntry: TierEntry = { name: "vidzee", fn: vidzee };
+    const fzEntry: TierEntry = { name: "fzmovies", fn: fzmovies };
 
     // Parallel: VidZee live check + FZMovies cache check. Either hit = Hindi.
     const checks: Promise<boolean>[] = [];
@@ -592,3 +605,84 @@ export async function availableAudio(
 
   return { original, audio, playing: hindiDub ? "hi" : original, labels };
 }
+
+// ── /languages cache: pf:lang:{type}:{tmdbId}:{s}:{e} (2026-10-09) ──────────
+// The dub button hits /languages on every info-screen open; the old code ran
+// a LIVE VidZee check (~7s) on every call with zero caching. Now: 6h fresh +
+// 1h stale, memory L1 + Redis L2 (shared api1+api2).
+const LANG_FRESH_MS = 6 * 3600_000;
+const LANG_STALE_MS = 1 * 3600_000;
+
+interface LangEnvelope {
+  v: 1;
+  info: AudioInfo;
+  freshUntil: number;
+  staleUntil: number;
+}
+
+const langKey = (
+  type: "movie" | "tv",
+  tmdbId: string,
+  season?: number,
+  episode?: number
+): string => `pf:lang:${type}:${tmdbId}:${season ?? 0}:${episode ?? 0}`;
+
+/** Cached wrapper around availableAudio() — what /languages routes call. */
+export async function cachedAvailableAudio(
+  tmdbId: string,
+  type: "movie" | "tv",
+  season?: number,
+  episode?: number
+): Promise<AudioInfo> {
+  const key = langKey(type, tmdbId, season, episode);
+  const now = Date.now();
+
+  const read = async (): Promise<LangEnvelope | null> => {
+    if (redisEnabled()) {
+      const rhit = await redisCacheGet<LangEnvelope>(key).catch(() => null);
+      if (rhit && rhit.v === 1 && rhit.info) {
+        cacheSet(key, rhit, Math.max(0, rhit.freshUntil - now), Math.max(0, rhit.staleUntil - rhit.freshUntil));
+        return rhit;
+      }
+    }
+    const hit = cacheGet<LangEnvelope>(key);
+    return hit ? hit.value : null;
+  };
+
+  const write = async (info: AudioInfo): Promise<void> => {
+    const env: LangEnvelope = {
+      v: 1,
+      info,
+      freshUntil: now + LANG_FRESH_MS,
+      staleUntil: now + LANG_FRESH_MS + LANG_STALE_MS,
+    };
+    cacheSet(key, env, LANG_FRESH_MS, LANG_STALE_MS);
+    if (redisEnabled()) {
+      await redisCacheSet(key, env, Math.floor((LANG_FRESH_MS + LANG_STALE_MS) / 1000)).catch(() => {});
+    }
+  };
+
+  const env = await read();
+  if (env) {
+    if (now < env.freshUntil) return env.info;
+    if (now < env.staleUntil) {
+      // Stale: serve now, revalidate in the background (best-effort).
+      background(
+        (async () => {
+          try {
+            await write(await availableAudio(tmdbId, type, season, episode));
+          } catch {
+            /* keep serving stale */
+          }
+        })()
+      );
+      return env.info;
+    }
+  }
+  const info = await availableAudio(tmdbId, type, season, episode);
+  await write(info);
+  return info;
+}
+
+// Re-export for /health (single import surface).
+export { wrapperStatus };

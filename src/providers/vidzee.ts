@@ -13,7 +13,7 @@
  * Ali's preference (2026-10-08): Hindi dubbed audio FIRST, English fallback.
  * Chain tries VidZee before VidLink; on miss the normal chain takes over.
  */
-import type { ProviderResult, StreamQuality } from "./types.js";
+import type { ProviderCallOpts, ProviderResult, StreamQuality } from "./types.js";
 import { fetchUpstream } from "./failures.js";
 
 const BASE = "https://core.vidzee.wtf";
@@ -42,7 +42,8 @@ export async function vidzee(
   tmdbId: string,
   type: "movie" | "tv",
   season?: number,
-  episode?: number
+  episode?: number,
+  opts?: ProviderCallOpts
 ): Promise<ProviderResult | null> {
   const url =
     type === "movie"
@@ -58,7 +59,10 @@ export async function vidzee(
     url,
     {
       headers: { "User-Agent": "Mozilla/5.0 (Linux; Android 14)" },
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      // Lane loser-abort composes with the internal 7s timeout.
+      signal: opts?.signal
+        ? AbortSignal.any([opts.signal, AbortSignal.timeout(FETCH_TIMEOUT_MS)])
+        : AbortSignal.timeout(FETCH_TIMEOUT_MS),
     },
     { contentMissStatuses: [404, 502] }
   );

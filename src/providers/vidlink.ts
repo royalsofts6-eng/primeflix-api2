@@ -3,7 +3,7 @@
  * Key verified working 2026-10-08. Daily canary probe watches for rotation.
  */
 import nacl from "tweetnacl";
-import type { ProviderResult, StreamQuality, Subtitle } from "./types.js";
+import type { ProviderCallOpts, ProviderResult, StreamQuality, Subtitle } from "./types.js";
 import { fetchUpstream } from "./failures.js";
 
 const KEY_HEX =
@@ -59,7 +59,8 @@ export async function vidlink(
   tmdbId: string,
   type: "movie" | "tv",
   season?: number,
-  episode?: number
+  episode?: number,
+  opts?: ProviderCallOpts
 ): Promise<ProviderResult | null> {
   const token = generateToken(tmdbId);
   const url =
@@ -78,7 +79,10 @@ export async function vidlink(
           ? `https://vidlink.pro/movie/${tmdbId}`
           : `https://vidlink.pro/tv/${tmdbId}/${season ?? 1}/${episode ?? 1}`,
     },
-    signal: AbortSignal.timeout(8000),
+    // Lane loser-abort composes with the internal 8s timeout.
+    signal: opts?.signal
+      ? AbortSignal.any([opts.signal, AbortSignal.timeout(8000)])
+      : AbortSignal.timeout(8000),
   });
   const data = await res.json();
   return parseResponse(data);

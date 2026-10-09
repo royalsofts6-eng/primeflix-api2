@@ -17,6 +17,15 @@ export interface ProviderResult {
   provider: string;
   qualities: StreamQuality[];
   subtitles?: Subtitle[];
+  /** e.g. MovieBox wrapper Edge-Cache-Cookie — the player sends it as a
+   *  Cookie header on manifest + segment requests (without it: 403). */
+  cookie?: string;
+}
+
+/** Options passed to every provider call (race.ts). */
+export interface ProviderCallOpts {
+  /** Lane-shared signal — set when the lane settles so losers abort. */
+  signal?: AbortSignal;
 }
 
 /** Provider function signature. */
@@ -24,7 +33,8 @@ export type ProviderFn = (
   tmdbId: string,
   type: "movie" | "tv",
   season?: number,
-  episode?: number
+  episode?: number,
+  opts?: ProviderCallOpts
 ) => Promise<ProviderResult | null>;
 
 /**
