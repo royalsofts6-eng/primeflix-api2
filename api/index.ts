@@ -43,6 +43,7 @@ import {
 } from "../src/security/plain.js";
 import { globalBackstopState } from "../src/security/ratelimit.js";
 import { tmdbCoolingDown } from "../src/tmdb.js";
+import { backgroundWired } from "../src/revalidate.js";
 
 const VERSION = "1.3.0";
 const CLUSTER = process.env.CLUSTER_NAME || "api1";
@@ -263,6 +264,10 @@ export default async function handler(req: any, res: any) {
         backstop: await globalBackstopState(),
         cache: cacheStats(), streamCache: sc, fzmovies: fzStats(),
         security: securityStats(), redis: await redisHealth(),
+        // P1 FIX (2026-10-09, QA Phase F): post-response background work
+        // (prefetch writer, watch-history, stale revalidate) must be wired
+        // via waitUntil — false means the Phase F bug is present.
+        backgroundWired: backgroundWired(),
       });
     }
 
