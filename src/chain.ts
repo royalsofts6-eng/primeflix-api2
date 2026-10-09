@@ -157,12 +157,16 @@ export async function setProviderCooldown(
 // report INCRs pf:dead:{provider}:{yyyy-mm-dd} (7d TTL). These counters
 // used to be write-only — now:
 //   (a) /health exposes them (monitoring can see a dying provider), and
-//   (b) a canary rule: 5+ dead reports for one provider in a day cools the
-//       provider cluster-wide for 1h ("dead" class, picked up by
+//   (b) a canary rule: 25+ dead reports for one provider in a day cools
+//       the provider cluster-wide for 1h ("dead" class, picked up by
 //       redisProviderCooldowns → providerBlocked → skipped in the race).
+//       FIX 4 (2026-10-09): raised 5/day → 25/day — QA's own testing
+//       traffic tripped the 5/day canary and cooled working providers.
 // Fail-open throughout: Redis down -> counts skipped, never throws.
-/** Dead reports/day for one provider before the canary cools it. */
-export const DEAD_CANARY_THRESHOLD = 5;
+/** Dead reports/day for one provider before the canary cools it.
+ * FIX 4 (2026-10-09): 5/day → 25/day — QA testing traffic tripped the
+ * old threshold and deprioritized working providers. */
+export const DEAD_CANARY_THRESHOLD = 25;
 const DEAD_COOLDOWN_TTL_SEC = 3600;
 
 const todayStr = (): string => new Date().toISOString().slice(0, 10);

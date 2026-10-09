@@ -9,13 +9,13 @@
  * zero new backend round-trip).
  *
  * Provider-specific fresh TTLs (seconds), 12h ceiling (Phase D):
- *   VidZee 2h (token lifetime 180min verified — the old 30m re-resolved 4x
- *     too often) · VidLink 2h · FZMovies 10h · MovieBox wrapper 1h
- *     (conservative, expiry unverified) · default 30m
+ *   VidZee fresh 2h BUT token-capped at 80 min (CDN auth_key expires
+ *     ~90–100 min — FIX 6 2026-10-09) · VidLink 2h · FZMovies 10h ·
+ *     MovieBox wrapper 1h (conservative, expiry unverified) · default 30m
  * plus a 15-minute stale-while-revalidate window. The envelope fresh TTL
- * is min(12h, shortest provider lifetime in the envelope) — the resolution
- * result lives 12h, but no provider URL outlives ~80% of its signed-URL
- * lifetime.
+ * is min(12h, shortest provider lifetime in the envelope, shortest signed-
+ * URL token lifetime) — the resolution result lives 12h, but no provider
+ * URL outlives its real token expiry.
  *
  * Read path: Redis (shared api1+api2) → in-memory (per-instance) → live.
  *
@@ -44,6 +44,15 @@ const TTL_BY_PROVIDER: Record<string, number> = {
   vaplayer: 3600,
   moviebox: 3600,
   "moviebox-hi": 3600,
+};
+// Signed-URL TOKEN lifetimes (seconds) — the real expiry of playback URLs
+// inside envelopes, which can be SHORTER than the provider's fresh TTL.
+// FIX 6 (2026-10-09): VidZee CDN auth_key tokens expire ~90–100 min, so a
+// VidZee-leg envelope cached 2h would serve stale URLs → CDN 403 →
+// "Connection lost" in the app. Cap VidZee legs at 80 min (conservative).
+// Providers absent here have no separate token cap (fresh TTL governs).
+const TOKEN_LIFETIME_BY_PROVIDER: Record<string, number> = {
+  vidzee: 80 * 60,
 };
 const DEFAULT_TTL_S = 30 * 60;
 /**
@@ -218,11 +227,19 @@ async function writeEnvelope(key: string, rkey: string, result: ChainResult): Pr
   // would land on a dead URL. Clamp to the SHORTEST provider lifetime in
   // the envelope (winner + every alternate), so no alternate outlives its
   // URL's real expiry.
+  // FIX 6 (2026-10-09): additionally clamp each provider leg by its
+  // signed-URL TOKEN lifetime (TOKEN_LIFETIME_BY_PROVIDER — e.g. VidZee
+  // auth_key ~90–100 min, capped at 80 min). Envelope TTL =
+  // min over winners of min(provider fresh TTL, provider token lifetime),
+  // so a cached envelope can never serve a CDN-expired URL (→ 403 →
+  // "Connection lost").
   const ttlOf = (p?: string): number => (p && TTL_BY_PROVIDER[p]) || DEFAULT_TTL_S;
+  const tokenLifeOf = (p?: string): number => (p && TOKEN_LIFETIME_BY_PROVIDER[p]) || Number.POSITIVE_INFINITY;
+  const legTtlOf = (p?: string): number => Math.min(ttlOf(p), tokenLifeOf(p));
   const ttlS = Math.min(
     MAX_FRESH_TTL_S,
-    ttlOf(result.provider),
-    ...((result.alternates ?? []).map((a) => ttlOf(a.provider)))
+    legTtlOf(result.provider),
+    ...((result.alternates ?? []).map((a) => legTtlOf(a.provider)))
   );
   const now = Date.now();
   const { alternates, ...rest } = result;
