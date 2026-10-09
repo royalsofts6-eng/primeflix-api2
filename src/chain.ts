@@ -284,7 +284,7 @@ export class ChainContentMissError extends Error {
  * congestion, timeout, network, 5xx, key-death, abort). A miss-only chain
  * means the catalog genuinely lacks the title — safe to negative-cache.
  */
-const CONTENT_MISS_RE = /no qualities|content-miss|not-available|not available/i;
+const CONTENT_MISS_RE = /no qualities|content-miss|null body|not-available|not available/i;
 const TRANSIENT_RE =
   /429|rate.?limit|pacer|timed? ?out|timeout|network|econn|socket|refused|dns|key-death|forbidden|not_found|abort|upstream|5\d\d/i;
 
