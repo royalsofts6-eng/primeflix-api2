@@ -12,6 +12,10 @@ import {
   prefetchStreamOnDetail,
   wrapperStatus,
   RACE_MODE,
+  recordDeadReport,
+  readDeadCounters,
+  deadCanaryToday,
+  DEAD_CANARY_THRESHOLD,
 } from "../src/chain.js";
 import { NotAvailableError } from "../src/providers/types.js";
 import { raceStats } from "../src/race.js";
@@ -32,9 +36,13 @@ import {
   registerPlain,
   refreshPlain,
   revokePlain,
+  apiKeyKilled,
+  adminKeyConfigured,
 } from "../src/security/plain.js";
+import { globalBackstopState } from "../src/security/ratelimit.js";
+import { tmdbCoolingDown } from "../src/tmdb.js";
 
-const VERSION = "1.2.1";
+const VERSION = "1.3.0";
 const CLUSTER = process.env.CLUSTER_NAME || "api1";
 const PUBLIC_PATHS = new Set(["/", "/health", "/api", "/api/health"]);
 
@@ -223,6 +231,18 @@ export default async function handler(req: any, res: any) {
         moviebox: await wrapperStatus(),
         streamCacheHitRate: total ? +(sc.hits / total).toFixed(3) : null,
         providers: providerHealth(), providerCooldowns: await providerCooldowns(),
+        // P1-1 (2026-10-09): dead-URL counters are no longer write-only —
+        // /health exposes per-provider daily counts, and providers at the
+        // canary threshold (5+/day) are cooled cluster-wide (see
+        // providerCooldowns "dead" class above).
+        deadCounters: await readDeadCounters(),
+        deadCanary: { threshold: DEAD_CANARY_THRESHOLD, providers: await deadCanaryToday() },
+        // P1-6 (2026-10-09): TMDB cluster-wide cooldown state.
+        tmdbCooldown: await tmdbCoolingDown(),
+        // P1-7 (2026-10-09): abuse-surface state.
+        apiKeyKilled: await apiKeyKilled(),
+        adminKeyConfigured: adminKeyConfigured(),
+        backstop: await globalBackstopState(),
         cache: cacheStats(), streamCache: sc, fzmovies: fzStats(),
         security: securityStats(), redis: await redisHealth(),
       });
@@ -388,14 +408,16 @@ export default async function handler(req: any, res: any) {
       // per title+audio, but a second provider dying for the same title
       // within the hour is still a canary signal worth counting. Provider
       // names are allowlisted into the key (no injection).
+      // P1-1 (2026-10-09): counters are no longer write-only — recordDeadReport
+      // INCRs, returns today's count, and cools the provider cluster-wide
+      // for 1h when the canary threshold (5/day) is reached.
       const providerName =
         typeof b.provider === "string" && /^[a-z0-9-]{1,32}$/i.test(b.provider)
           ? b.provider.toLowerCase()
           : null;
+      let deadCount = 0;
       if (providerName) {
-        const day = new Date().toISOString().slice(0, 10);
-        await redisCommand(["INCR", `pf:dead:${providerName}:${day}`]).catch(() => null);
-        await redisCommand(["EXPIRE", `pf:dead:${providerName}:${day}`, 7 * 24 * 3600]).catch(() => null);
+        deadCount = await recordDeadReport(providerName);
       }
       const guard = await redisCommand(["SET", guardKey, "1", "NX", "EX", 3600]).catch(() => null);
       if (guard !== "OK") {
@@ -406,7 +428,21 @@ export default async function handler(req: any, res: any) {
       // keeps serving the dead envelope from memory for up to its TTL even
       // though Redis was evicted (2026-10-09).
       cacheDel(streamCacheKey(type, id, season, episode, audio));
-      if (b.reason === "hindi_no_longer_available") {
+      // P1-2 (2026-10-09): the `hindi_no_longer_available` reason branch
+      // was dead code — the app never sends that reason (it only sends
+      // segment_403/404/timeout / playback_error). Backend now INFERS it:
+      // a dead-URL report against a Hindi-lane provider (vidzee, fzmovies,
+      // moviebox-hi) on the Hindi/default chain means the Hindi dub itself
+      // is gone — evict pf:lang + pf:mbhilang so the dub button re-probes
+      // instead of lying for 6h/24h. The explicit reason still works if the
+      // app ever sends it.
+      const HINDI_LANE = new Set(["vidzee", "fzmovies", "moviebox-hi"]);
+      const hindiGone =
+        b.reason === "hindi_no_longer_available" ||
+        (providerName !== null &&
+          HINDI_LANE.has(providerName) &&
+          (audio === undefined || audio === "hi"));
+      if (hindiGone) {
         const langKey = `pf:lang:${type}:${id}:${season ?? 0}:${episode ?? 0}`;
         await redisCommand(["DEL", langKey]).catch(() => null);
         // Same memory-drop for the lang entry (chain.ts caches pf:lang:*
@@ -419,7 +455,7 @@ export default async function handler(req: any, res: any) {
           await redisCommand(["DEL", `pf:mbhilang:movie:${id}`]).catch(() => null);
         }
       }
-      return send(res, 200, ok({ evicted: true }));
+      return send(res, 200, ok({ evicted: true, deadReportsToday: deadCount }));
     }
 
     // NiaziTV Turkish dramas (stream URLs NEVER cached — signed/expiring)
@@ -509,14 +545,16 @@ export default async function handler(req: any, res: any) {
     // FZMovies batch warm (2026-10-09): cursor-based top-200 movie cycle for
     // the cache-only FZMovies Hindi tier. CRON_SECRET protected, header-only.
     // Called every 4h from a Hatch cron (api1 only — Redis is shared).
-    // Usage: GET /v1/cron/fz-warm-batch?limit=8  (x-cron-secret header)
+    // P1-4 (2026-10-09): throughput raised — 6 workers, 5–10s gaps only after
+    // real scrapes (fresh entries skip in ~1 Redis read).
+    // Usage: GET /v1/cron/fz-warm-batch?limit=16  (x-cron-secret header)
     if (path === "/v1/cron/fz-warm-batch") {
       const secret = header("x-cron-secret");
       if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
         return send(res, 401, fail("unauthorized", "BAD_CRON_SECRET"));
       }
-      const rawLimit = parseInt(q.get("limit") || "8", 10);
-      const limit = Math.min(Math.max(Number.isFinite(rawLimit) ? rawLimit : 8, 1), 20);
+      const rawLimit = parseInt(q.get("limit") || "16", 10);
+      const limit = Math.min(Math.max(Number.isFinite(rawLimit) ? rawLimit : 16, 1), 40);
       const report = await warmFZMoviesBatch(limit);
       return send(res, 200, ok(report));
     }

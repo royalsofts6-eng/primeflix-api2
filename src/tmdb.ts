@@ -17,7 +17,7 @@
  * If TMDB fails and stale cache exists -> serve stale (never blank).
  */
 import { cacheGet, cacheSet } from "./cache.js";
-import { redisEnabled, redisCacheGet, redisCacheSet } from "./security/redis.js";
+import { redisEnabled, redisCacheGet, redisCacheSet, redisCommand } from "./security/redis.js";
 
 const TMDB = "https://api.themoviedb.org/3";
 
@@ -25,6 +25,60 @@ function key(): string {
   const k = process.env.TMDB_API_KEY;
   if (!k) throw new Error("TMDB_API_KEY not configured");
   return k;
+}
+
+// ── TMDB 429 backoff (P1-6, 2026-10-09) ──────────────────────────────────────
+// TMDB is 40 req/10s per egress IP, shared across ALL Vercel customers on
+// the same IPs — a cold-instance miss storm used to stretch a 429 into a
+// long outage because every instance kept retrying. Now:
+//   (a) cluster-wide cooldown: the first 429 sets pf:cooldown:tmdb (60s) in
+//       Redis — every instance (api1 + api2) skips live TMDB fetches and
+//       serves stale instead, and
+//   (b) per-instance exponential backoff: 5s, 10s, 20s, 40s, 60s cap —
+//       reset on the first success. (Instances are short-lived, so this is
+//       the local fast path; the Redis key is the cross-instance truth.)
+// Fail-open: Redis down -> local backoff only.
+const TMDB_COOLDOWN_KEY = "pf:cooldown:tmdb";
+const TMDB_COOLDOWN_S = 60;
+let tmdbBackoffStep = 0;
+let tmdbBackoffUntil = 0;
+
+/** True while any instance (or this one) is backing off TMDB. For /health. */
+export async function tmdbCoolingDown(): Promise<boolean> {
+  if (Date.now() < tmdbBackoffUntil) return true;
+  if (!redisEnabled()) return false;
+  try {
+    return (await redisCommand(["GET", TMDB_COOLDOWN_KEY]).catch(() => null)) !== null;
+  } catch {
+    return false;
+  }
+}
+
+async function tmdbNote429(): Promise<void> {
+  tmdbBackoffStep = Math.min(tmdbBackoffStep + 1, 4);
+  tmdbBackoffUntil = Date.now() + Math.min(60_000, 5_000 * 2 ** (tmdbBackoffStep - 1));
+  if (redisEnabled()) {
+    await redisCommand(["SET", TMDB_COOLDOWN_KEY, "1", "EX", TMDB_COOLDOWN_S]).catch(() => {});
+  }
+}
+
+function tmdbNoteSuccess(): void {
+  tmdbBackoffStep = 0;
+  tmdbBackoffUntil = 0;
+}
+
+/**
+ * Serve stale (never blank) — memory L1 first, then the shared Redis copy.
+ * Returns the stale payload, or null when nothing stale exists.
+ */
+async function tmdbServeStale(cacheKey: string): Promise<unknown | null> {
+  const stale = cacheGet<unknown>(cacheKey);
+  if (stale) return stale.value;
+  if (redisEnabled()) {
+    const rhit = await redisCacheGet<unknown>(`pf:tmdb:${cacheKey}`).catch(() => null);
+    if (rhit) return rhit;
+  }
+  return null;
 }
 
 export interface TmdbFetchOpts {
@@ -46,6 +100,16 @@ async function tmdbGet(path: string, params: Record<string, string>, opts: TmdbF
       cacheSet(opts.cacheKey, rhit, opts.ttlMs, opts.staleMs);
       return rhit;
     }
+  }
+
+  // P1-6 (2026-10-09): cluster-wide 429 cooldown — while ANY instance is
+  // backing off, skip the live fetch entirely and serve stale (never
+  // blank). This stops a cold-instance miss storm from stretching a 429
+  // into a long outage.
+  if (await tmdbCoolingDown()) {
+    const stale = await tmdbServeStale(opts.cacheKey);
+    if (stale !== null) return stale;
+    throw new Error("TMDB rate limited (cooldown)");
   }
 
   // Single-flight: concurrent requests for the same cache key share ONE
@@ -75,9 +139,16 @@ async function tmdbGet(path: string, params: Record<string, string>, opts: TmdbF
         headers: { "User-Agent": "PrimeFlix/1.0" },
         signal: AbortSignal.timeout(8000),
       });
-      if (res.status === 429) throw new Error("TMDB rate limited (HTTP 429)");
+      if (res.status === 429) {
+        // P1-6: record the 429 BEFORE the stale fallback below — the first
+        // 429 arms the cluster-wide cooldown so the next fetch (any
+        // instance) skips upstream instead of re-hitting TMDB.
+        await tmdbNote429();
+        throw new Error("TMDB rate limited (HTTP 429)");
+      }
       if (!res.ok) throw new Error(`TMDB HTTP ${res.status}`);
       const data = await res.json();
+      tmdbNoteSuccess();
       cacheSet(opts.cacheKey, data, opts.ttlMs, opts.staleMs);
       // Fan out to Redis so every instance (and both clusters) shares it.
       if (redisEnabled()) {
@@ -87,12 +158,8 @@ async function tmdbGet(path: string, params: Record<string, string>, opts: TmdbF
     } catch (e) {
       // Serve stale on failure (C4: never blank screen) — memory first,
       // then the shared Redis copy.
-      const stale = cacheGet<unknown>(opts.cacheKey);
-      if (stale) return stale.value;
-      if (redisEnabled()) {
-        const rhit = await redisCacheGet<unknown>(rkey).catch(() => null);
-        if (rhit) return rhit;
-      }
+      const stale = await tmdbServeStale(opts.cacheKey);
+      if (stale !== null) return stale;
       throw e;
     } finally {
       inflight.delete(opts.cacheKey);

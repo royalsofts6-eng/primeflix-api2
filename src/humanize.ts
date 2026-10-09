@@ -47,6 +47,18 @@ export function warmTitleGapMs(): number {
 }
 
 /**
+ * Gap between two FZMovies warm scrapes: 5–10s (P1-4, 2026-10-09).
+ * FZMovies is our own scrape domain — not the anti-block-sensitive
+ * MovieBox wrapper — so the 20–60s human gap is overkill here and was
+ * throttling the 4h FZ cycle to ~15 cold warms/day against a ~480/day
+ * need. Skipped entirely when the title was already fresh (no upstream
+ * hit happened, so there is nothing to be polite about).
+ */
+export function warmFZGapMs(): number {
+  return 5_000 + Math.random() * 5_000;
+}
+
+/**
  * Jittered cron time inside [startH, endH) — deterministic per date so two
  * clusters never double-schedule, but never a round :00 (machine smell).
  * Returns { h, m } for building the schedule.

@@ -19,7 +19,7 @@
  * tried FIRST (shared across api1/api2); the in-memory bucket is the
  * fallback when Redis is unavailable (degrades to best-effort).
  */
-import { redisEnabled, redisRateCheck } from "./redis.js";
+import { redisEnabled, redisRateCheck, redisCommand } from "./redis.js";
 
 /** Device-wide burst bucket (P1 2026-10-09). */
 const TB_CAPACITY = 120;
@@ -93,6 +93,46 @@ export interface RateLimit {
   resetSec?: number;
 }
 
+/**
+ * Global backstop (P1-7, 2026-10-09): per-identity buckets stop one bad
+ * actor, but a leaked shared key (or a botnet) spreads across identities —
+ * the per-identity limits never see the aggregate. This is the
+ * cluster-wide circuit breaker: ~3000 requests/minute across ALL
+ * identities on the cluster (Redis-shared, api1+api2 each have their own
+ * window key — a "cluster" here is one Vercel project). Trips fail-closed
+ * with 429 for everyone except nothing (health checks are public and
+ * unaffected — this sits inside checkRateLimit, which only runs on gated
+ * routes). Fail-open when Redis is unavailable.
+ */
+const BACKSTOP_LIMIT_PER_MIN = 3000;
+
+export async function checkGlobalBackstop(): Promise<{ tripped: boolean; count: number }> {
+  if (!redisEnabled()) return { tripped: false, count: 0 };
+  const window = Math.floor(Date.now() / 60_000);
+  const key = `pf:backstop:${window}`;
+  try {
+    const n = await redisCommand(["INCR", key]);
+    if (n === 1 || n === "1") await redisCommand(["EXPIRE", key, 90]).catch(() => null);
+    const count = Number(n);
+    return { tripped: Number.isFinite(count) && count > BACKSTOP_LIMIT_PER_MIN, count: Number.isFinite(count) ? count : 0 };
+  } catch {
+    return { tripped: false, count: 0 };
+  }
+}
+
+/** Current backstop window state for /health (read-only — never INCRs). */
+export async function globalBackstopState(): Promise<{ limit: number; count: number; tripped: boolean }> {
+  if (!redisEnabled()) return { limit: BACKSTOP_LIMIT_PER_MIN, count: 0, tripped: false };
+  try {
+    const window = Math.floor(Date.now() / 60_000);
+    const n = Number(await redisCommand(["GET", `pf:backstop:${window}`]).catch(() => null));
+    const count = Number.isFinite(n) ? n : 0;
+    return { limit: BACKSTOP_LIMIT_PER_MIN, count, tripped: count > BACKSTOP_LIMIT_PER_MIN };
+  } catch {
+    return { limit: BACKSTOP_LIMIT_PER_MIN, count: 0, tripped: false };
+  }
+}
+
 /** Seconds until the current fixed window rolls over. */
 function windowRetryAfterSec(): number {
   const nowS = Math.floor(Date.now() / 1000);
@@ -100,6 +140,18 @@ function windowRetryAfterSec(): number {
 }
 
 export async function checkRateLimit(pathname: string, identity: string): Promise<RateLimit> {
+  // P1-7: global backstop FIRST — a leaked shared key spreads across
+  // identities, so per-identity buckets alone can't see the aggregate.
+  const backstop = await checkGlobalBackstop();
+  if (backstop.tripped) {
+    return {
+      allowed: false,
+      retryAfterSec: windowRetryAfterSec(),
+      limit: BACKSTOP_LIMIT_PER_MIN,
+      remaining: 0,
+      resetSec: windowRetryAfterSec(),
+    };
+  }
   let capacity: number;
   let cls: string;
   if (pathname.startsWith("/v1/stream/")) {

@@ -13,6 +13,7 @@ import {
 } from "./devices.js";
 import { checkRateLimit, type RateLimit } from "./ratelimit.js";
 import { deriveDeviceSecretFromRef } from "./hmac.js";
+import { redisEnabled, redisCommand } from "./redis.js";
 
 export interface GateResult {
   ok: boolean;
@@ -86,6 +87,55 @@ export function readBody(req: any): Promise<string> {
  * Order: X-API-Key (day-1) → HMAC-SHA256 + JWT.
  * Returns { ok: true } or { ok: false, status, code, error }.
  */
+// ── P1-7 (2026-10-09): admin/app key split + kill-switch ─────────────────────
+// The day-1 shared API key (hardcoded in the APK) used to double as the
+// ADMIN key — anyone who decompiled the APK could revoke member keys.
+// Admin operations now need ADMIN_KEY (a distinct Vercel env var). When
+// ADMIN_KEY is unset, the day-1 key still works as admin (backward compat —
+// nothing breaks on deploy); set ADMIN_KEY in Vercel to complete the split.
+const ADMIN_KEY = process.env.ADMIN_KEY || null;
+let adminFallbackWarned = false;
+
+/** True when ADMIN_KEY is set (the split is complete). For /health. */
+export function adminKeyConfigured(): boolean {
+  return ADMIN_KEY !== null && ADMIN_KEY.length > 0;
+}
+
+function isAdminKey(got: string | null): boolean {
+  if (ADMIN_KEY && got === ADMIN_KEY) return true;
+  if (!adminKeyConfigured() && !adminFallbackWarned) {
+    adminFallbackWarned = true;
+    console.warn("[security] ADMIN_KEY not set — day-1 API key still accepted for admin ops (backward compat). Set ADMIN_KEY in Vercel env to complete the split.");
+  }
+  const apiKey = process.env.API_KEY;
+  return !!apiKey && got === apiKey;
+}
+
+// Runtime kill-switch for the day-1 shared app key (P1-7): SET pf:kill:apikey
+// in Redis (Upstash console or CLI) and every instance rejects the shared
+// key immediately — no redeploy, no env change. HMAC members and the admin
+// key keep working. Memoized 10s per instance so the check costs ~1 Redis
+// read per 10s, not per request.
+const KILL_KEY = "pf:kill:apikey";
+const KILL_MEMO_MS = 10_000;
+let killMemo: { at: number; killed: boolean } | null = null;
+
+/** True when the shared day-1 API key is runtime-killed. For the gate + /health. */
+export async function apiKeyKilled(): Promise<boolean> {
+  const now = Date.now();
+  if (killMemo && now - killMemo.at < KILL_MEMO_MS) return killMemo.killed;
+  let killed = false;
+  try {
+    if (redisEnabled()) {
+      killed = (await redisCommand(["GET", KILL_KEY]).catch(() => null)) !== null;
+    }
+  } catch {
+    killed = false;
+  }
+  killMemo = { at: now, killed };
+  return killed;
+}
+
 export async function authGatePlain(
   method: string,
   pathname: string,
@@ -104,6 +154,11 @@ export async function authGatePlain(
   const apiKey = process.env.API_KEY;
   const gotKey = header("X-API-Key");
   if (apiKey && gotKey === apiKey) {
+    // P1-7: runtime kill-switch — a compromised shared key is cut off in
+    // ~10s (memo window) with zero redeploy.
+    if (await apiKeyKilled()) {
+      return { ok: false, status: 403, code: "APIKEY_KILLED", error: "api key disabled" };
+    }
     const rl = await checkRateLimit(pathname, devId ? `dev:${devId}` : "apikey");
     if (!rl.allowed)
       return { ok: false, status: 429, code: "RATE_LIMITED", error: "rate limited", retryAfter: rl.retryAfterSec, rlHeaders: rateLimitHeaders(rl) };
@@ -183,13 +238,14 @@ export async function refreshPlain(bodyText: string, clientIp: string): Promise<
   return { status: 200, json: { success: true, data: { token, expiresIn: JWT_TTL_S } } };
 }
 
-/** POST /v1/auth/revoke (admin: X-API-Key) */
+/** POST /v1/auth/revoke (admin: ADMIN_KEY, or day-1 X-API-Key as fallback) */
 export async function revokePlain(
   bodyText: string,
   header: HeaderGetter
 ): Promise<{ status: number; json: unknown }> {
-  const apiKey = process.env.API_KEY;
-  if (!apiKey || header("X-API-Key") !== apiKey) {
+  // P1-7: admin key is now DISTINCT from the app key. Falls back to the
+  // day-1 key only until ADMIN_KEY is set in Vercel env.
+  if (!isAdminKey(header("X-API-Key"))) {
     return { status: 403, json: { success: false, error: "admin only", code: "FORBIDDEN" } };
   }
   let body: { memberKey?: string };

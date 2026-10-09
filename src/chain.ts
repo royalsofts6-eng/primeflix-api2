@@ -132,7 +132,7 @@ export function providerHealth(): Record<string, unknown> {
 // when one instance cools a provider (429, or 5 consecutive failures),
 // every instance skips it. Fail-open: Redis down -> in-memory only.
 const COOLDOWN_TTL_SEC = 300;
-const COOLDOWN_CLASSES = ["network", "not_found", "forbidden", "rate_limited", "server"];
+const COOLDOWN_CLASSES = ["network", "not_found", "forbidden", "rate_limited", "server", "dead"];
 
 /** Set a provider cooldown. Never throws (fail-open). */
 export async function setProviderCooldown(
@@ -149,6 +149,94 @@ export async function setProviderCooldown(
       : COOLDOWN_TTL_SEC;
   const value = retryAfterMs ? String(retryAfterMs) : "1";
   await redisCommand(["SET", `pf:cooldown:${provider}:${cls}`, value, "EX", ttl]).catch(() => null);
+}
+
+// ── Dead-URL counters → canary + circuit wiring (P1-1, 2026-10-09) ──────────
+// The app reports dead playback URLs via POST /v1/stream/report; each
+// report INCRs pf:dead:{provider}:{yyyy-mm-dd} (7d TTL). These counters
+// used to be write-only — now:
+//   (a) /health exposes them (monitoring can see a dying provider), and
+//   (b) a canary rule: 5+ dead reports for one provider in a day cools the
+//       provider cluster-wide for 1h ("dead" class, picked up by
+//       redisProviderCooldowns → providerBlocked → skipped in the race).
+// Fail-open throughout: Redis down -> counts skipped, never throws.
+/** Dead reports/day for one provider before the canary cools it. */
+export const DEAD_CANARY_THRESHOLD = 5;
+const DEAD_COOLDOWN_TTL_SEC = 3600;
+
+const todayStr = (): string => new Date().toISOString().slice(0, 10);
+
+/**
+ * Record one dead-URL report for `provider`. Returns today's count
+ * (0 when Redis is unavailable). Cools the provider when the canary
+ * threshold is reached. Never throws.
+ */
+export async function recordDeadReport(provider: string): Promise<number> {
+  if (!redisEnabled()) return 0;
+  try {
+    const key = `pf:dead:${provider}:${todayStr()}`;
+    const n = Number(await redisCommand(["INCR", key]));
+    await redisCommand(["EXPIRE", key, 7 * 24 * 3600]).catch(() => null);
+    if (Number.isFinite(n) && n >= DEAD_CANARY_THRESHOLD) {
+      await redisCommand([
+        "SET", `pf:cooldown:${provider}:dead`, String(n), "EX", DEAD_COOLDOWN_TTL_SEC,
+      ]).catch(() => null);
+    }
+    return Number.isFinite(n) ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+export interface DeadCounter {
+  provider: string;
+  day: string;
+  count: number;
+}
+
+/**
+ * Read all pf:dead:{provider}:{day} counters (today + yesterday, newest
+ * first). For /health. Fail-open -> [].
+ */
+export async function readDeadCounters(): Promise<DeadCounter[]> {
+  const out: DeadCounter[] = [];
+  if (!redisEnabled()) return out;
+  try {
+    const keys: string[] = [];
+    let cursor = "0";
+    do {
+      const r = (await redisCommand(["SCAN", cursor, "MATCH", "pf:dead:*", "COUNT", "100"])) as
+        | [string, string[]]
+        | null;
+      if (!Array.isArray(r) || r.length < 2) break;
+      cursor = String(r[0]);
+      for (const k of r[1] || []) keys.push(k);
+    } while (cursor !== "0");
+    if (keys.length === 0) return out;
+    // MGET in chunks (Upstash REST is one command per request).
+    for (let i = 0; i < keys.length; i += 50) {
+      const chunk = keys.slice(i, i + 50);
+      const vals = (await redisCommand(["MGET", ...chunk]).catch(() => null)) as unknown[] | null;
+      chunk.forEach((k, j) => {
+        const m = /^pf:dead:([a-z0-9-]+):(\d{4}-\d{2}-\d{2})$/.exec(k);
+        if (!m) return;
+        const count = Number(Array.isArray(vals) ? vals[j] : 0);
+        if (Number.isFinite(count) && count > 0) {
+          out.push({ provider: m[1], day: m[2], count });
+        }
+      });
+    }
+    out.sort((a, b) => (b.day === a.day ? b.count - a.count : b.day < a.day ? -1 : 1));
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+/** Providers at/over the canary threshold TODAY (for /health alerts). */
+export async function deadCanaryToday(): Promise<DeadCounter[]> {
+  const today = todayStr();
+  return (await readDeadCounters()).filter((d) => d.day === today && d.count >= DEAD_CANARY_THRESHOLD);
 }
 
 // ── VidLink key-death corroboration (P0-2, refined live 2026-10-09) ─────────

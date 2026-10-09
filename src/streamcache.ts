@@ -198,7 +198,17 @@ async function readEnvelope(key: string, rkey: string): Promise<StreamCacheEnvel
 
 async function writeEnvelope(key: string, rkey: string, result: ChainResult): Promise<void> {
   if (!result?.qualities?.length) return; // never cache empty/failed results
-  const ttlS = TTL_BY_PROVIDER[result.provider] ?? DEFAULT_TTL_S;
+  // P1-3 (2026-10-09): the envelope used to inherit the WINNER's TTL — a
+  // MovieBox alternate (signed URL, ~1h life) inside a VidZee-winner
+  // envelope (2h) could be served expired, and the client-side failover
+  // would land on a dead URL. Clamp to the SHORTEST provider lifetime in
+  // the envelope (winner + every alternate), so no alternate outlives its
+  // URL's real expiry.
+  const ttlOf = (p?: string): number => (p && TTL_BY_PROVIDER[p]) || DEFAULT_TTL_S;
+  const ttlS = Math.min(
+    ttlOf(result.provider),
+    ...((result.alternates ?? []).map((a) => ttlOf(a.provider)))
+  );
   const now = Date.now();
   const { alternates, ...rest } = result;
   const env: StreamCacheEnvelope = {

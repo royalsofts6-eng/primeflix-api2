@@ -3,8 +3,9 @@
  *
  * Warms the top ~200 TMDB trending titles (100 movies + 100 TV, day window)
  * into the shared stream cache, so members hit cache instead of the provider
- * race. Triggered via GET /v1/cron/stream-warm (CRON_SECRET header, same
- * pattern as /v1/cron/fz-warm).
+ * race. Each title warms all three audio variants (default + hi + en, P1-5)
+ * so dub-button taps never pay the live race. Triggered via
+ * GET /v1/cron/stream-warm (CRON_SECRET header, same pattern as /v1/cron/fz-warm).
  *
  * Bounded for Vercel's 60s maxDuration: a Redis cursor cycles through the
  * title list (`limit` titles per run, default 40, 4-way concurrency, hard
@@ -17,7 +18,7 @@ import { resolveStream } from "./chain.js";
 import { isStreamCachedFresh } from "./streamcache.js";
 import { warmFZMovies } from "./providers/fzmovies.js";
 import { redisCommand } from "./security/redis.js";
-import { warmTitleGapMs } from "./humanize.js";
+import { warmTitleGapMs, warmFZGapMs } from "./humanize.js";
 
 const CURSOR_KEY = "pf:warm:cursor";
 const DEADLINE_MS = 50_000;
@@ -80,6 +81,14 @@ export async function warmTrendingStreams(limit: number): Promise<WarmReport> {
   let processed = 0;
   let deadlineHit = false;
   let idx = 0;
+  // P1-5 (2026-10-09): the old loop warmed ONLY the default (Hindi-first)
+  // audio key — ?audio=hi / ?audio=en keys were always cold, so a
+  // dub-button tap paid the full live race. Now each title warms all
+  // three variants (hi first — it is the dub-button tap). Each variant is
+  // an independent cache key with its own fresh check, so already-warm
+  // variants skip in ~1 Redis read; the hard deadline bounds the extra
+  // live resolves.
+  const variants: (string | undefined)[] = [undefined, "hi", "en"];
   const workers = Array.from(
     { length: Math.min(CONCURRENCY, batch.length) },
     async (): Promise<void> => {
@@ -91,17 +100,23 @@ export async function warmTrendingStreams(limit: number): Promise<WarmReport> {
         const t = batch[idx++];
         const season = t.type === "tv" ? 1 : undefined;
         const episode = t.type === "tv" ? 1 : undefined;
-        try {
-          if (await isStreamCachedFresh(t.type, t.id, season, episode, undefined)) {
-            skipped++;
-            continue;
+        for (const audio of variants) {
+          if (Date.now() > deadline) {
+            deadlineHit = true;
+            break;
           }
-          // Default (Hindi-first) chain — writes to the shared stream cache
-          // on success via resolveStreamCached.
-          await resolveStream(t.id, t.type, season, episode, undefined);
-          warmed++;
-        } catch {
-          failed++;
+          try {
+            if (await isStreamCachedFresh(t.type, t.id, season, episode, audio)) {
+              skipped++;
+              continue;
+            }
+            // Default (Hindi-first) chain — writes to the shared stream cache
+            // on success via resolveStreamCached.
+            await resolveStream(t.id, t.type, season, episode, audio);
+            warmed++;
+          } catch {
+            failed++;
+          }
         }
         processed++;
       }
@@ -118,11 +133,14 @@ export async function warmTrendingStreams(limit: number): Promise<WarmReport> {
 // The FZMovies Hindi tier is cache-only on the request path — without a warm
 // cron it is effectively DEAD. This batch endpoint (called every 4h from a
 // Hatch cron, api1 only — Redis is shared) cycles through the top ~200
-// trending movies with cursor pf:fzwarm:cursor. Human gaps (20–60s) between
-// titles keep the scrape polite.
+// trending movies with cursor pf:fzwarm:cursor.
+// P1-4 (2026-10-09): the old shape (2 workers, 20–60s gaps, limit 8) warmed
+// ~2–3 cold titles/run (~15/day) against a ~480/day need — 30x short. Now:
+// 6 workers, 5–10s gaps ONLY after a real upstream scrape (fresh entries
+// skip in ~1 Redis read with no gap at all), and a bigger per-run limit.
 const FZ_CURSOR_KEY = "pf:fzwarm:cursor";
 const FZ_DEADLINE_MS = 50_000;
-const FZ_CONCURRENCY = 2;
+const FZ_CONCURRENCY = 6;
 const FZ_MAX_TITLES = 200;
 const FZ_PAGES = 10; // 10 pages x 20 = 200 movies
 
@@ -181,20 +199,28 @@ export async function warmFZMoviesBatch(limit: number): Promise<FZWarmReport> {
           break;
         }
         const id = batch[idx++];
+        let scraped = false;
         try {
           // warmFZMovies checks Redis first (2026-10-09 fix) — fresh
           // entries skip in ~1 command, no re-scrape.
           const w = await warmFZMovies(id, "movie", true);
-          if (w.warmed && w.reason === "warmed") warmed++;
-          else if (w.warmed) skipped++;
-          else failed++;
+          if (w.warmed && w.reason === "warmed") {
+            warmed++;
+            scraped = true;
+          } else if (w.warmed) {
+            skipped++;
+          } else {
+            failed++;
+          }
         } catch {
           failed++;
         }
         processed++;
-        // Human gap between titles (anti-block) — skip if the deadline looms.
-        if (idx < batch.length && Date.now() + 20_000 < deadline) {
-          await sleep(Math.min(warmTitleGapMs(), Math.max(0, deadline - Date.now() - 1000)));
+        // P1-4 (2026-10-09): gap ONLY after a real upstream scrape — a
+        // fresh skip cost ~1 Redis read, so there is nothing to be polite
+        // about. Skip the gap entirely when the deadline looms.
+        if (scraped && idx < batch.length && Date.now() + 12_000 < deadline) {
+          await sleep(Math.min(warmFZGapMs(), Math.max(0, deadline - Date.now() - 1000)));
         }
       }
     }

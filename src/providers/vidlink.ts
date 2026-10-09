@@ -6,9 +6,18 @@ import nacl from "tweetnacl";
 import type { ProviderCallOpts, ProviderResult, StreamQuality, Subtitle } from "./types.js";
 import { fetchUpstream } from "./failures.js";
 
-const KEY_HEX =
-  process.env.VIDLINK_KEY ||
-  "c75136c5668bbfe65a7ecad431a745db68b5f381555b38d8f6c699449cf11fcd";
+/**
+ * VidLink encryption key — P1-8 (2026-10-09): read from the VIDLINK_KEY env
+ * var first. The built-in value stays ONLY as a fallback default so prod
+ * never breaks on a missing env var; a loud warning goes to the Vercel
+ * logs when the fallback is in use. Set VIDLINK_KEY in the Vercel project
+ * env to complete the move.
+ */
+const BUILTIN_KEY_HEX = "c75136c5668bbfe65a7ecad431a745db68b5f381555b38d8f6c699449cf11fcd";
+const KEY_HEX = process.env.VIDLINK_KEY || BUILTIN_KEY_HEX;
+if (!process.env.VIDLINK_KEY) {
+  console.warn("[vidlink] VIDLINK_KEY env not set — using built-in fallback key. Set VIDLINK_KEY in Vercel env.");
+}
 const KEY = Buffer.from(KEY_HEX, "hex");
 const NONCE = new Uint8Array(24);
 const TIME_OFFSET_S = 480;
