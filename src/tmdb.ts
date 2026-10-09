@@ -185,12 +185,18 @@ export const tmdb = {
     tmdbGet("/trending/tv/" + timeWindow, { language: "en-US", page }, {
       cacheKey: `tmdb:trending:tv:${timeWindow}:${page}`, ttlMs: 6 * H, staleMs: 7 * D,
     }),
+  // Slow-net (2026-10-09): append_to_response=credits,videos REMOVED — nothing
+  // reads them. Server-side needs only title/year/original_language (base
+  // fields: fzmovies.ts, moviebox.ts, chain.ts); the app parses details via
+  // TitleItem.fromTmdb which never touches credits/videos/cast/trailers.
+  // Dropping the append shrinks the upstream fetch, the Redis entry, and the
+  // response (detail payload 16910 -> 513 bytes on real cached data).
   movie: (id: string) =>
-    tmdbGet(`/movie/${id}`, { language: "en-US", append_to_response: "credits,videos" }, {
+    tmdbGet(`/movie/${id}`, { language: "en-US" }, {
       cacheKey: `tmdb:movie:${id}`, ttlMs: 24 * H, staleMs: 7 * D,
     }),
   tv: (id: string) =>
-    tmdbGet(`/tv/${id}`, { language: "en-US", append_to_response: "credits,videos" }, {
+    tmdbGet(`/tv/${id}`, { language: "en-US" }, {
       cacheKey: `tmdb:tv:${id}`, ttlMs: 24 * H, staleMs: 7 * D,
     }),
   tvSeason: (id: string, season: number) =>
@@ -229,10 +235,69 @@ export const tmdb = {
     }),
 };
 
-/** Edge cache headers matching the TTLs above (seconds). */
+/** Edge cache headers matching the TTLs above (seconds).
+ * NOTE (slow-net 2026-10-09): this stays UNUSED on purpose. Catalog routes
+ * sit behind the auth gate, and Vercel's edge cache keys on URL only — a
+ * `public, s-maxage` response would be served to callers with NO key at all
+ * (auth bypass via CDN). Catalog stays `private`; see privateCache() in
+ * api/index.ts. */
 export function edgeCacheHeaders(ttlMs: number, staleMs: number): Record<string, string> {
   return {
     "Cache-Control": `public, s-maxage=${Math.floor(ttlMs / 1000)}, stale-while-revalidate=${Math.floor(staleMs / 1000)}`,
+  };
+}
+
+// ── Slow-net payload strip (2026-10-09) ─────────────────────────────────────
+// Ground truth for every KEPT field: the Android app's TitleItem.fromTmdb
+// (Models.kt) + PrimeFlixClient.episodes()/.seasons()/.searchWithPager().
+// Anything the app never reads is dropped from the RESPONSE. The Redis +
+// memory cache keeps the full base TMDB object — server-side readers
+// (chain.ts original_language; fzmovies/moviebox title+year) are unaffected.
+// List items (trending / discover / search / recommendations / upcoming).
+const LIST_ITEM_KEEP = new Set([
+  "id", "title", "name", "poster_path", "backdrop_path", "overview",
+  "release_date", "first_air_date", "vote_average", "adult",
+  "genre_ids", "genres", "origin_country", "media_type",
+]);
+// Detail = list-item fields + tv season count (seasons() reads number_of_seasons).
+const DETAIL_KEEP = new Set([...LIST_ITEM_KEEP, "number_of_seasons"]);
+// TV-season episodes (episodes() reads episode_number, name, still_path).
+const EPISODE_KEEP = new Set(["id", "season_number", "episode_number", "name", "still_path"]);
+const SEASON_KEEP = new Set(["id", "name", "season_number", "episodes"]);
+
+function pick(src: unknown, keep: Set<string>): Record<string, unknown> {
+  const o: Record<string, unknown> = {};
+  if (src && typeof src === "object") {
+    const s = src as Record<string, unknown>;
+    for (const k of keep) if (k in s) o[k] = s[k];
+  }
+  return o;
+}
+
+/** Strip a TMDB list payload (results[]). Keeps pagination fields. */
+export function stripTmdbList(payload: unknown): unknown {
+  const p = (payload || {}) as { page?: unknown; total_pages?: unknown; total_results?: unknown; results?: unknown };
+  const results = Array.isArray(p.results) ? p.results : [];
+  return {
+    page: p.page ?? 1,
+    total_pages: p.total_pages ?? 1,
+    total_results: p.total_results ?? results.length,
+    results: results.map((it) => pick(it, LIST_ITEM_KEEP)),
+  };
+}
+
+/** Strip a TMDB movie/tv detail payload (fromTmdb fields + number_of_seasons). */
+export function stripTmdbDetail(payload: unknown): unknown {
+  return pick(payload, DETAIL_KEEP);
+}
+
+/** Strip a TMDB tv-season payload (episodes[] trimmed to app-read fields). */
+export function stripTmdbSeason(payload: unknown): unknown {
+  const p = (payload || {}) as { episodes?: unknown };
+  const episodes = Array.isArray(p.episodes) ? p.episodes : [];
+  return {
+    ...pick(p, SEASON_KEEP),
+    episodes: episodes.map((e) => pick(e, EPISODE_KEEP)),
   };
 }
 

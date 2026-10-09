@@ -2,7 +2,8 @@
  * PrimeFlix API — plain Vercel serverless function (no framework).
  * Uniform contract: { success: true, data } | { success: false, error, code }
  */
-import { tmdb, TTL } from "../src/tmdb.js";
+import { tmdb, TTL, stripTmdbList, stripTmdbDetail, stripTmdbSeason } from "../src/tmdb.js";
+import { createHash } from "crypto";
 import {
   resolveStream,
   ChainDeadlineError,
@@ -45,7 +46,7 @@ import { globalBackstopState } from "../src/security/ratelimit.js";
 import { tmdbCoolingDown } from "../src/tmdb.js";
 import { backgroundWired } from "../src/revalidate.js";
 
-const VERSION = "1.3.0";
+const VERSION = "1.4.0";
 const CLUSTER = process.env.CLUSTER_NAME || "api1";
 const PUBLIC_PATHS = new Set(["/", "/health", "/api", "/api/health"]);
 
@@ -67,8 +68,38 @@ const fail = (error: string, code: string) => ({ success: false, error, code });
  */
 function privateCache(ttlMs: number): Record<string, string> {
   return {
-    "Cache-Control": `private, max-age=${Math.floor(ttlMs / 1000)}`,
+    // Slow-net (2026-10-09): stale-while-revalidate added for the BROWSER
+    // cache (slow networks serve stale instantly while revalidating).
+    // s-maxage is deliberately NOT set: these routes sit behind the auth
+    // gate and Vercel's edge cache keys on URL only — `public` would serve
+    // authed data to keyless callers (auth bypass via CDN).
+    "Cache-Control": `private, max-age=${Math.floor(ttlMs / 1000)}, stale-while-revalidate=86400`,
   };
+}
+
+/**
+ * Slow-net (2026-10-09): ETag/304 on heavy catalog responses. The ETag is a
+ * sha1 of the exact response bytes; a repeat call whose If-None-Match
+ * carries it gets a 304 with no body. Safe with `private` caching — the
+ * response is per-key, so the ETag never leaks across users.
+ */
+function sendCatalog(res: any, req: any, data: unknown, headers: Record<string, string> = {}) {
+  const body = JSON.stringify(data);
+  const etag = `"${createHash("sha1").update(body).digest("hex")}"`;
+  const inm: unknown = req.headers?.["if-none-match"];
+  const match =
+    inm === "*" ||
+    (typeof inm === "string" &&
+      (inm === etag || inm.split(",").map((s) => s.trim()).includes(etag)));
+  res.setHeader("ETag", etag);
+  for (const [k, v] of Object.entries(headers)) res.setHeader(k, v);
+  if (match) {
+    res.statusCode = 304;
+    return res.end();
+  }
+  res.statusCode = 200;
+  res.setHeader("Content-Type", "application/json");
+  res.end(body);
 }
 
 /**
@@ -275,11 +306,11 @@ export default async function handler(req: any, res: any) {
     let m: RegExpMatchArray | null;
     if (path === "/v1/tmdb/trending/movie") {
       const data = await tmdb.trendingMovie(q.get("time_window") || "day");
-      return send(res, 200, ok(data), privateCache(TTL.trending));
+      return sendCatalog(res, req, ok(stripTmdbList(data)), privateCache(TTL.trending));
     }
     if (path === "/v1/tmdb/trending/tv") {
       const data = await tmdb.trendingTv(q.get("time_window") || "day");
-      return send(res, 200, ok(data), privateCache(TTL.trending));
+      return sendCatalog(res, req, ok(stripTmdbList(data)), privateCache(TTL.trending));
     }
     if (path === "/v1/tmdb/discover/movie") {
       // Allowlisted params only (Ali 2026-10-08: Home rails — Hollywood, Bollywood,
@@ -295,24 +326,24 @@ export default async function handler(req: any, res: any) {
         if (v) params[k] = v;
       }
       const data = await tmdb.discoverMovie(params);
-      return send(res, 200, ok(data), privateCache(TTL.discover));
+      return sendCatalog(res, req, ok(stripTmdbList(data)), privateCache(TTL.discover));
     }
     if (path === "/v1/tmdb/movie/upcoming") {
       // Must sit BEFORE the /v1/tmdb/movie/:id regex below.
       const data = await tmdb.upcomingMovies(q.get("region") || "US", q.get("page") || "1");
-      return send(res, 200, ok(data), privateCache(TTL.discover));
+      return sendCatalog(res, req, ok(stripTmdbList(data)), privateCache(TTL.discover));
     }
     if ((m = path.match(/^\/v1\/tmdb\/movie\/([^/]+)$/))) {
       const id = tmdbId(m[1]);
       if (!id) return send(res, 400, fail("invalid tmdb id", "BAD_QUERY"));
       const data = await tmdb.movie(id);
-      return send(res, 200, ok(data), privateCache(TTL.details));
+      return sendCatalog(res, req, ok(stripTmdbDetail(data)), privateCache(TTL.details));
     }
     if ((m = path.match(/^\/v1\/tmdb\/movie\/([^/]+)\/recommendations$/))) {
       const id = tmdbId(m[1]);
       if (!id) return send(res, 400, fail("invalid tmdb id", "BAD_QUERY"));
       const data = await tmdb.movieRecs(id);
-      return send(res, 200, ok(data), privateCache(TTL.details));
+      return sendCatalog(res, req, ok(stripTmdbList(data)), privateCache(TTL.details));
     }
     if ((m = path.match(/^\/v1\/tmdb\/tv\/([^/]+)\/season\/([^/]+)$/))) {
       const id = tmdbId(m[1]);
@@ -322,19 +353,19 @@ export default async function handler(req: any, res: any) {
         return send(res, 400, fail("invalid season (expected 1-100)", "BAD_QUERY"));
       }
       const data = await tmdb.tvSeason(id, season);
-      return send(res, 200, ok(data), privateCache(TTL.details));
+      return sendCatalog(res, req, ok(stripTmdbSeason(data)), privateCache(TTL.details));
     }
     if ((m = path.match(/^\/v1\/tmdb\/tv\/([^/]+)\/recommendations$/))) {
       const id = tmdbId(m[1]);
       if (!id) return send(res, 400, fail("invalid tmdb id", "BAD_QUERY"));
       const data = await tmdb.tvRecs(id);
-      return send(res, 200, ok(data), privateCache(TTL.details));
+      return sendCatalog(res, req, ok(stripTmdbList(data)), privateCache(TTL.details));
     }
     if ((m = path.match(/^\/v1\/tmdb\/tv\/([^/]+)$/))) {
       const id = tmdbId(m[1]);
       if (!id) return send(res, 400, fail("invalid tmdb id", "BAD_QUERY"));
       const data = await tmdb.tv(id);
-      return send(res, 200, ok(data), privateCache(TTL.details));
+      return sendCatalog(res, req, ok(stripTmdbDetail(data)), privateCache(TTL.details));
     }
     if (path === "/v1/tmdb/search/multi") {
       const query = q.get("query") || "";
@@ -343,7 +374,7 @@ export default async function handler(req: any, res: any) {
       // mapped to 500. Cap server-side — never proxy garbage upstream.
       if (query.length > 200) return send(res, 400, fail("query too long (max 200 chars)", "BAD_QUERY"));
       const data = await tmdb.search(query, q.get("page") || "1");
-      return send(res, 200, ok(data), privateCache(TTL.search));
+      return sendCatalog(res, req, ok(stripTmdbList(data)), privateCache(TTL.search));
     }
 
     // Available audio languages (Ali 2026-10-08: dub button shows ONLY what
@@ -522,16 +553,16 @@ export default async function handler(req: any, res: any) {
     // NiaziTV Turkish dramas (stream URLs NEVER cached — signed/expiring)
     if (path === "/v1/niazi/series") {
       const data = await getSeries();
-      return send(res, 200, ok(data), privateCache(NIAZI_TTL.series));
+      return sendCatalog(res, req, ok(data), privateCache(NIAZI_TTL.series));
     }
     if ((m = path.match(/^\/v1\/niazi\/series\/([^/]+)\/seasons$/))) {
       const data = await getSeasons(m[1]);
-      return send(res, 200, ok(data), privateCache(NIAZI_TTL.seasons));
+      return sendCatalog(res, req, ok(data), privateCache(NIAZI_TTL.seasons));
     }
     if ((m = path.match(/^\/v1\/niazi\/series\/([^/]+)\/episodes$/))) {
       // Series id (NOT season id — aggregates every season page).
       const data = await getEpisodesForSerie(m[1]);
-      return send(res, 200, ok(data), privateCache(NIAZI_TTL.episodes));
+      return sendCatalog(res, req, ok(data), privateCache(NIAZI_TTL.episodes));
     }
     if ((m = path.match(/^\/v1\/niazi\/stream\/([^/]+)\/([^/]+)$/))) {
       const data = await getStreamUrl(m[1], m[2]);
@@ -554,7 +585,7 @@ export default async function handler(req: any, res: any) {
         // in-app — say so honestly instead of "awaiting-source".
         reason: c.type === "youtube" ? "youtube-only" : "awaiting-source",
       }));
-      return send(res, 200, ok({
+      return sendCatalog(res, req, ok({
         refreshedAt: data.refreshedAt,
         total: data.total,
         alive: playable.length,
