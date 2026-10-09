@@ -36,6 +36,20 @@ export function nodeHeaderGetter(req: any): HeaderGetter {
   };
 }
 
+/**
+ * P0 429 fix (2026-10-09): per-device rate identity.
+ * A valid X-Device-Id header moves the requester out of the shared
+ * "apikey"/member bucket into its own `dev:<id>` bucket, so per-device
+ * capacity scales linearly with users. Missing/invalid values fall back
+ * to the existing identity logic (never 400 here — just ignored).
+ */
+const DEVICE_ID_RE = /^[A-Za-z0-9-_]{1,64}$/;
+export function sanitizeDeviceId(raw: string | null): string | null {
+  if (!raw) return null;
+  const v = raw.trim();
+  return DEVICE_ID_RE.test(v) ? v : null;
+}
+
 export function readBody(req: any): Promise<string> {
   return new Promise((resolve, reject) => {
     let data = "";
@@ -68,11 +82,16 @@ export async function authGatePlain(
   /** raw query string (bound into the HMAC signature) */
   query = ""
 ): Promise<GateResult> {
+  // P0 429 fix: per-device rate identity from X-Device-Id (sanitized).
+  // A valid device id moves the requester into its own `dev:<id>` bucket;
+  // missing/invalid → existing fallback identity per mode (unchanged).
+  const devId = sanitizeDeviceId(header("X-Device-Id"));
+
   // ── Mode 1: day-1 API key ──
   const apiKey = process.env.API_KEY;
   const gotKey = header("X-API-Key");
   if (apiKey && gotKey === apiKey) {
-    const rl = await checkRateLimit(pathname, "apikey");
+    const rl = await checkRateLimit(pathname, devId ? `dev:${devId}` : "apikey");
     if (!rl.allowed)
       return { ok: false, status: 429, code: "RATE_LIMITED", error: "rate limited", retryAfter: rl.retryAfterSec };
     return { ok: true, mode: "apikey" };
@@ -89,7 +108,7 @@ export async function authGatePlain(
   if (check.memberRef && (await isMemberRefRevoked(check.memberRef))) {
     return { ok: false, status: 403, code: "REVOKED", error: "member key revoked" };
   }
-  const rl = await checkRateLimit(pathname, check.memberRef || "unknown");
+  const rl = await checkRateLimit(pathname, devId ? `dev:${devId}` : (check.memberRef || "unknown"));
   if (!rl.allowed) {
     return { ok: false, status: 429, code: "RATE_LIMITED", error: "rate limited", retryAfter: rl.retryAfterSec };
   }
