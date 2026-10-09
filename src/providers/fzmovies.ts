@@ -27,7 +27,7 @@
  * Chain position (Ali 2026-10-08): VidZee → FZMovies → VidLink.
  * FZMovies is a PROPER Hindi tier, not a backup.
  */
-import { cacheGet, cacheSet } from "../cache.js";
+import { cacheGet, cacheSet, ck } from "../cache.js";
 import { tmdb } from "../tmdb.js";
 import { redisEnabled, redisCacheGet, redisCacheSet } from "../security/redis.js";
 import type { ProviderFn, ProviderResult, StreamQuality } from "./types.js";
@@ -349,7 +349,8 @@ async function resolveOnBase(
 
 // ── Cache + request-path entry points ───────────────────────────────────────
 
-const cacheKey = (tmdbId: string) => `fz:hi:${tmdbId}`;
+// Phase D (2026-10-09): versioned key pf:v3:fz:{tmdbId} (10h TTL — links live ~12h).
+const cacheKey = (tmdbId: string) => ck("fz", tmdbId);
 
 /**
  * Cache-ONLY lookup for the request path. Never blocks, never scrapes.

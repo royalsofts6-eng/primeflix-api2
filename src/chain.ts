@@ -37,8 +37,9 @@ import {
   type FailureClass,
 } from "./providers/failures.js";
 import { redisEnabled, redisCacheGet, redisCacheSet, redisCommand } from "./security/redis.js";
-import { cacheGet, cacheSet } from "./cache.js";
+import { cacheGet, cacheSet, ck } from "./cache.js";
 import { cachedStreamProviders, resolveStreamCached, isStreamCachedFresh, isNegativelyCached } from "./streamcache.js";
+import type { StreamCacheStat } from "./streamcache.js";
 import {
   raceTier,
   rankAlternates,
@@ -752,10 +753,13 @@ export async function resolveStream(
   type: "movie" | "tv",
   season?: number,
   episode?: number,
-  audio?: string
+  audio?: string,
+  stat?: StreamCacheStat
 ): Promise<ChainResult> {
-  return resolveStreamCached({ tmdbId, type, season, episode, audio }, () =>
-    resolveStreamLive(tmdbId, type, season, episode, audio)
+  return resolveStreamCached(
+    { tmdbId, type, season, episode, audio },
+    () => resolveStreamLive(tmdbId, type, season, episode, audio),
+    stat
   );
 }
 
@@ -975,15 +979,18 @@ export async function availableAudio(
   return { original, audio, playing: hindiDub ? "hi" : original, labels };
 }
 
-// ── /languages cache: pf:lang:{type}:{tmdbId}:{s}:{e} (2026-10-09) ──────────
+// ── /languages cache: pf:v3:lang:{type}:{tmdbId}:{s}:{e} (Phase D 2026-10-09)
 // The dub button hits /languages on every info-screen open; the old code ran
-// a LIVE VidZee check (~7s) on every call with zero caching. Now: 6h fresh +
-// 1h stale, memory L1 + Redis L2 (shared api1+api2).
-const LANG_FRESH_MS = 6 * 3600_000;
+// a LIVE VidZee check (~7s) on every call with zero caching. Now: 12h fresh
+// + 1h stale (a source's dub catalog changes on a days/weeks timescale —
+// dubs are produced, not toggled — so 12h is safe; player dead-reports and
+// the hindi-gone inference still evict early), memory L1 + Redis L2
+// (shared api1+api2). This kills the 7s live check entirely.
+const LANG_FRESH_MS = 12 * 3600_000;
 const LANG_STALE_MS = 1 * 3600_000;
 
 interface LangEnvelope {
-  v: 1;
+  v: 2;
   info: AudioInfo;
   freshUntil: number;
   staleUntil: number;
@@ -994,7 +1001,7 @@ const langKey = (
   tmdbId: string,
   season?: number,
   episode?: number
-): string => `pf:lang:${type}:${tmdbId}:${season ?? 0}:${episode ?? 0}`;
+): string => ck("lang", type, tmdbId, season ?? 0, episode ?? 0);
 
 /** Cached wrapper around availableAudio() — what /languages routes call. */
 export async function cachedAvailableAudio(
@@ -1009,7 +1016,7 @@ export async function cachedAvailableAudio(
   const read = async (): Promise<LangEnvelope | null> => {
     if (redisEnabled()) {
       const rhit = await redisCacheGet<LangEnvelope>(key).catch(() => null);
-      if (rhit && rhit.v === 1 && rhit.info) {
+      if (rhit && rhit.v === 2 && rhit.info) {
         cacheSet(key, rhit, Math.max(0, rhit.freshUntil - now), Math.max(0, rhit.staleUntil - rhit.freshUntil));
         return rhit;
       }
@@ -1020,7 +1027,7 @@ export async function cachedAvailableAudio(
 
   const write = async (info: AudioInfo): Promise<void> => {
     const env: LangEnvelope = {
-      v: 1,
+      v: 2,
       info,
       freshUntil: now + LANG_FRESH_MS,
       staleUntil: now + LANG_FRESH_MS + LANG_STALE_MS,

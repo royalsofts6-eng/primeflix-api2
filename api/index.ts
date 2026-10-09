@@ -20,11 +20,13 @@ import {
 import { NotAvailableError } from "../src/providers/types.js";
 import { raceStats } from "../src/race.js";
 import { warmFZMovies, fzStats } from "../src/providers/fzmovies.js";
-import { cacheStats } from "../src/cache.js";
+import { cacheStats, ck, CACHE_SCHEMA } from "../src/cache.js";
 import { streamCacheStats, streamCacheKey } from "../src/streamcache.js";
-import { warmTrendingStreams, warmFZMoviesBatch } from "../src/warm.js";
+import type { StreamCacheStat } from "../src/streamcache.js";
+import { warmTrendingStreams, warmFZMoviesBatch, noteWatch } from "../src/warm.js";
 import { redisCommand } from "../src/security/redis.js";
 import { cacheDel } from "../src/cache.js";
+import { mbhilangKey } from "../src/providers/moviebox.js";
 import { getSeries, getSeasons, getEpisodesForSerie, getStreamUrl, NIAZI_TTL } from "../src/niazitv.js";
 import { getChannels, refreshChannels, groupByCategory, hideDead, pendingChannels } from "../src/livetv.js";
 import { securityStats } from "../src/security/stats.js";
@@ -66,6 +68,20 @@ function privateCache(ttlMs: number): Record<string, string> {
   return {
     "Cache-Control": `private, max-age=${Math.floor(ttlMs / 1000)}`,
   };
+}
+
+/**
+ * Phase D (2026-10-09): X-Cache observability on every stream response —
+ * HIT (fresh envelope), STALE (served + background revalidate), MISS
+ * (live resolve), NEG (negative-cache fast-fail, set by the error path),
+ * plus the winning provider. Signed URLs themselves are never edge-cached
+ * (Cache-Control: no-store) — the shared Redis cache does the work.
+ */
+function streamCacheHeaders(stat: StreamCacheStat): Record<string, string> {
+  const headers: Record<string, string> = { "Cache-Control": "no-store" };
+  if (stat.status) headers["X-Cache"] = stat.status;
+  if (stat.provider) headers["X-Cache-Provider"] = stat.provider;
+  return headers;
 }
 
 /**
@@ -224,6 +240,8 @@ export default async function handler(req: any, res: any) {
       const total = sc.hits + sc.misses;
       return send(res, 200, {
         ok: true, cluster: CLUSTER, version: VERSION,
+        // Phase D (2026-10-09): 12h smart cache — versioned namespace.
+        cacheSchema: CACHE_SCHEMA,
         tmdbKeyConfigured: !!process.env.TMDB_API_KEY,
         // 4-source parallel system (2026-10-09)
         raceMode: RACE_MODE,
@@ -328,9 +346,10 @@ export default async function handler(req: any, res: any) {
     // Returns { audio, original, playing, labels }; `audio` stays top-level
     // for backward compat with older apps.
     // MUST sit before the /v1/stream/movie/:tmdbId regex below.
-    // Available audio languages — cached 6h (pf:lang:*) instead of a live
-    // VidZee check on every call (2026-10-09: was the biggest per-request
-    // waste). MUST sit before the /v1/stream/movie/:tmdbId regex below.
+    // Available audio languages — cached 12h (pf:v3:lang:*, Phase D) instead
+    // of a live VidZee check on every call (2026-10-09: was the biggest
+    // per-request waste). MUST sit before the /v1/stream/movie/:tmdbId
+    // regex below.
     if ((m = path.match(/^\/v1\/stream\/movie\/([^/]+)\/languages$/))) {
       const id = tmdbId(m[1]);
       if (!id) return send(res, 400, fail("invalid tmdb id", "BAD_QUERY"));
@@ -355,15 +374,22 @@ export default async function handler(req: any, res: any) {
       return send(res, 200, ok({ audio: info.audio, original: info.original, playing: info.playing, labels: info.labels }), { "Cache-Control": "no-store" });
     }
 
-    // Stream resolution (NEVER cache — signed URLs expire)
+    // Stream resolution — shared 12h smart cache (Phase D 2026-10-09):
+    // the envelope carries X-Cache: HIT|STALE|MISS + X-Cache-Provider so
+    // hit rates are observable per response. Signed-URL expiry is enforced
+    // by the provider-capped fresh TTLs in streamcache.ts, not here.
     // ?audio=hi → Hindi-dubbed only (VidZee); ?audio=en → English/original only.
     if ((m = path.match(/^\/v1\/stream\/movie\/([^/]+)$/))) {
       const id = tmdbId(m[1]);
       if (!id) return send(res, 400, fail("invalid tmdb id", "BAD_QUERY"));
       const audio = checkAudio(res, q.get("audio"));
       if (audio === null) return;
-      const data = await resolveStream(id, "movie", undefined, undefined, audio);
-      return send(res, 200, ok(data), { "Cache-Control": "no-store" });
+      const stat: StreamCacheStat = {};
+      const data = await resolveStream(id, "movie", undefined, undefined, audio, stat);
+      // Phase D: every successful Play feeds the watch-history ZSET — the
+      // pre-warm cron warms THESE titles first (not generic trending).
+      noteWatch("movie", id);
+      return send(res, 200, ok(data), streamCacheHeaders(stat));
     }
     if ((m = path.match(/^\/v1\/stream\/tv\/([^/]+)\/([^/]+)\/([^/]+)$/))) {
       const id = tmdbId(m[1]);
@@ -375,14 +401,18 @@ export default async function handler(req: any, res: any) {
       }
       const audio = checkAudio(res, q.get("audio"));
       if (audio === null) return;
-      const data = await resolveStream(id, "tv", season, episode, audio);
-      return send(res, 200, ok(data), { "Cache-Control": "no-store" });
+      const stat: StreamCacheStat = {};
+      const data = await resolveStream(id, "tv", season, episode, audio, stat);
+      // Phase D: every successful Play feeds the watch-history ZSET.
+      noteWatch("tv", id);
+      return send(res, 200, ok(data), streamCacheHeaders(stat));
     }
 
     // Dead-URL report (2026-10-09): the app calls this when every quality
     // AND every alternate failed playback. Guarded 1/hour/key (abuse +
-    // duplicate storms), evicts the whole envelope (+ pf:lang when the dub
-    // itself is gone), and counts per-provider dead signals for canaries.
+    // duplicate storms), evicts the whole envelope (+ pf:v3:lang when the dub
+    // itself is gone), logs to pf:v3:deadlog, and counts per-provider dead
+    // signals for canaries.
     // Member-auth via the standard gate (not a public path, not /v1/cron/*).
     if (path === "/v1/stream/report" && req.method === "POST") {
       // P0 fix (2026-10-09): reuse the auth gate's already-read body — the
@@ -402,7 +432,9 @@ export default async function handler(req: any, res: any) {
       const audio = b.audio === "hi" || b.audio === "en" ? b.audio : undefined;
       const season = type === "tv" ? posInt(String(b.season || "")) || undefined : undefined;
       const episode = type === "tv" ? posInt(String(b.episode || "")) || undefined : undefined;
-      const rkey = `pf:stream:${streamCacheKey(type, id, season, episode, audio)}`;
+      // Phase D (2026-10-09): versioned stream key pf:v3:stream:*. The
+      // 1/hour guard stays unversioned (operational state, not cache).
+      const rkey = ck("stream", streamCacheKey(type, id, season, episode, audio));
       const guardKey = `pf:report:${type}:${id}:${season ?? 0}:${episode ?? 0}:${audio || "def"}`;
       // Per-provider dead counter FIRST (2026-10-09): the 1/hour guard is
       // per title+audio, but a second provider dying for the same title
@@ -423,6 +455,26 @@ export default async function handler(req: any, res: any) {
       if (guard !== "OK") {
         return send(res, 200, ok({ evicted: false, reason: "already-reported-this-hour" }));
       }
+      // Phase D (2026-10-09, design §4a): dead-URL log — LPUSH +
+      // LTRIM 100 + 7d TTL so the team can see WHICH provider's URLs are
+      // dying (signature death vs. one-off blips).
+      const deadlogKey = ck("deadlog");
+      await redisCommand([
+        "LPUSH",
+        deadlogKey,
+        JSON.stringify({
+          provider: providerName,
+          type,
+          tmdbId: id,
+          season: season ?? 0,
+          episode: episode ?? 0,
+          audio: audio || "def",
+          reason: typeof b.reason === "string" ? b.reason.slice(0, 64) : null,
+          at: Date.now(),
+        }),
+      ]).catch(() => null);
+      await redisCommand(["LTRIM", deadlogKey, "0", "99"]).catch(() => null);
+      await redisCommand(["EXPIRE", deadlogKey, 7 * 24 * 3600]).catch(() => null);
       await redisCommand(["DEL", rkey]).catch(() => null);
       // Drop this instance's in-memory stream envelope too — otherwise it
       // keeps serving the dead envelope from memory for up to its TTL even
@@ -442,17 +494,21 @@ export default async function handler(req: any, res: any) {
         (providerName !== null &&
           HINDI_LANE.has(providerName) &&
           (audio === undefined || audio === "hi"));
-      if (hindiGone) {
-        const langKey = `pf:lang:${type}:${id}:${season ?? 0}:${episode ?? 0}`;
+      // Phase D (2026-10-09, design §4a): a 403/404 is signature death
+      // (not a network blip) — the lang envelope for this title must be
+      // re-probed immediately instead of lying for 12h.
+      const sigDeath = b.reason === "segment_403" || b.reason === "segment_404";
+      if (hindiGone || sigDeath) {
+        const langKey = ck("lang", type, id, season ?? 0, episode ?? 0);
         await redisCommand(["DEL", langKey]).catch(() => null);
-        // Same memory-drop for the lang entry (chain.ts caches pf:lang:*
+        // Same memory-drop for the lang entry (chain.ts caches pf:v3:lang:*
         // in-memory under the identical key).
         cacheDel(langKey);
         // The MovieBox-Hindi verdict may be stale now too (the dub is
         // reported gone) — drop it so the next /languages re-probes
         // instead of trusting yesterday's "1" for 24h.
         if (type === "movie") {
-          await redisCommand(["DEL", `pf:mbhilang:movie:${id}`]).catch(() => null);
+          await redisCommand(["DEL", mbhilangKey(id)]).catch(() => null);
         }
       }
       return send(res, 200, ok({ evicted: true, deadReportsToday: deadCount }));
@@ -544,17 +600,18 @@ export default async function handler(req: any, res: any) {
 
     // FZMovies batch warm (2026-10-09): cursor-based top-200 movie cycle for
     // the cache-only FZMovies Hindi tier. CRON_SECRET protected, header-only.
-    // Called every 4h from a Hatch cron (api1 only — Redis is shared).
+    // Called every 6h from a Hatch cron (api1 only — Redis is shared;
+    // Phase D 2026-10-09: 4h → 6h, 30 titles/run per the command budget).
     // P1-4 (2026-10-09): throughput raised — 6 workers, 5–10s gaps only after
     // real scrapes (fresh entries skip in ~1 Redis read).
-    // Usage: GET /v1/cron/fz-warm-batch?limit=16  (x-cron-secret header)
+    // Usage: GET /v1/cron/fz-warm-batch?limit=30  (x-cron-secret header)
     if (path === "/v1/cron/fz-warm-batch") {
       const secret = header("x-cron-secret");
       if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
         return send(res, 401, fail("unauthorized", "BAD_CRON_SECRET"));
       }
       const rawLimit = parseInt(q.get("limit") || "16", 10);
-      const limit = Math.min(Math.max(Number.isFinite(rawLimit) ? rawLimit : 16, 1), 40);
+      const limit = Math.min(Math.max(Number.isFinite(rawLimit) ? rawLimit : 16, 1), 30);
       const report = await warmFZMoviesBatch(limit);
       return send(res, 200, ok(report));
     }

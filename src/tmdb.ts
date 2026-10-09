@@ -16,7 +16,7 @@
  *
  * If TMDB fails and stale cache exists -> serve stale (never blank).
  */
-import { cacheGet, cacheSet } from "./cache.js";
+import { cacheGet, cacheSet, ck } from "./cache.js";
 import { redisEnabled, redisCacheGet, redisCacheSet, redisCommand } from "./security/redis.js";
 
 const TMDB = "https://api.themoviedb.org/3";
@@ -75,7 +75,8 @@ async function tmdbServeStale(cacheKey: string): Promise<unknown | null> {
   const stale = cacheGet<unknown>(cacheKey);
   if (stale) return stale.value;
   if (redisEnabled()) {
-    const rhit = await redisCacheGet<unknown>(`pf:tmdb:${cacheKey}`).catch(() => null);
+    // Phase D (2026-10-09): versioned Redis key pf:v3:tmdb:* (memory key stays unversioned — instance-local).
+    const rhit = await redisCacheGet<unknown>(ck("tmdb", cacheKey)).catch(() => null);
     if (rhit) return rhit;
   }
   return null;
@@ -93,7 +94,7 @@ async function tmdbGet(path: string, params: Record<string, string>, opts: TmdbF
 
   // Redis L2 (shared api1+api2): a cold instance reads the shared entry
   // instead of hitting TMDB. Backfills memory L1 on hit.
-  const rkey = `pf:tmdb:${opts.cacheKey}`;
+  const rkey = ck("tmdb", opts.cacheKey);
   if (redisEnabled()) {
     const rhit = await redisCacheGet<unknown>(rkey).catch(() => null);
     if (rhit) {

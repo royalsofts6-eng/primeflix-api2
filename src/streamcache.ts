@@ -3,16 +3,19 @@
  * stale-while-revalidate, request coalescing.
  *
  * Every successful resolveStream() result is cached under
- *   pf:stream:{type}:{tmdbId}:{season}:{episode}:{audio}
+ *   pf:v3:stream:{type}:{tmdbId}:{season}:{episode}:{audio}
  * as envelope v2: { v: 2, result, alternates[<=3], freshUntil, staleUntil }
  * (1 key, 1 read — the app fails over client-side across alternates with
  * zero new backend round-trip).
  *
- * Provider-specific fresh TTLs (seconds):
+ * Provider-specific fresh TTLs (seconds), 12h ceiling (Phase D):
  *   VidZee 2h (token lifetime 180min verified — the old 30m re-resolved 4x
  *     too often) · VidLink 2h · FZMovies 10h · MovieBox wrapper 1h
  *     (conservative, expiry unverified) · default 30m
- * plus a 15-minute stale-while-revalidate window.
+ * plus a 15-minute stale-while-revalidate window. The envelope fresh TTL
+ * is min(12h, shortest provider lifetime in the envelope) — the resolution
+ * result lives 12h, but no provider URL outlives ~80% of its signed-URL
+ * lifetime.
  *
  * Read path: Redis (shared api1+api2) → in-memory (per-instance) → live.
  *
@@ -27,7 +30,7 @@
  * "hindi dubbed not available") are NEVER cached.
  */
 import { redisEnabled, redisCacheGet, redisCacheSet, redisCommand } from "./security/redis.js";
-import { cacheGet, cacheSet, cacheDel } from "./cache.js";
+import { cacheGet, cacheSet, cacheDel, ck } from "./cache.js";
 import { background } from "./revalidate.js";
 import { NotAvailableError } from "./providers/types.js";
 import type { ChainResult } from "./chain.js";
@@ -43,6 +46,15 @@ const TTL_BY_PROVIDER: Record<string, number> = {
   "moviebox-hi": 3600,
 };
 const DEFAULT_TTL_S = 30 * 60;
+/**
+ * Phase D (2026-10-09): 12h ceiling on the envelope's fresh TTL. The
+ * resolution RESULT is cached for up to 12h, but each provider's URL is
+ * capped at ~80% of its signed-URL lifetime (TTL_BY_PROVIDER) — so the
+ * envelope fresh TTL = min(12h, shortest provider lifetime in the
+ * envelope). Language/catalog data (barely changes) gets the full 12h
+ * elsewhere; playback URLs never outlive their real expiry.
+ */
+const MAX_FRESH_TTL_S = 12 * 3600;
 /** Stale-while-revalidate window (seconds) — bounded. */
 const STALE_WINDOW_S = 15 * 60;
 /** How long a waiter polls Redis for another instance's result. */
@@ -95,7 +107,9 @@ interface NegEntry {
   at: number;
 }
 
-const negRedisKey = (key: string): string => `pf:neg:${key}`;
+// Phase D (2026-10-09): all shared keys versioned (pf:v3:*) so a schema
+// change is one CACHE_SCHEMA bump — old keys orphan-expire, never FLUSHDB.
+const negRedisKey = (key: string): string => ck("neg", key);
 const negMemKey = (key: string): string => `pf:negmem:${key}`;
 
 /** True when the error is a content miss (safe to negative-cache). Never throws. */
@@ -171,7 +185,7 @@ export function streamCacheKey(
   return `${type}:${tmdbId}:${season ?? 0}:${episode ?? 0}:${audio || "def"}`;
 }
 
-const redisKeyFor = (key: string): string => `pf:stream:${key}`;
+const redisKeyFor = (key: string): string => ck("stream", key);
 
 // ── Envelope read/write ─────────────────────────────────────────────────────
 
@@ -206,6 +220,7 @@ async function writeEnvelope(key: string, rkey: string, result: ChainResult): Pr
   // URL's real expiry.
   const ttlOf = (p?: string): number => (p && TTL_BY_PROVIDER[p]) || DEFAULT_TTL_S;
   const ttlS = Math.min(
+    MAX_FRESH_TTL_S,
     ttlOf(result.provider),
     ...((result.alternates ?? []).map((a) => ttlOf(a.provider)))
   );
@@ -304,7 +319,7 @@ async function resolveLiveSingleflight(
 
   // Cross-instance: Redis lock. Whoever holds it resolves; the rest poll
   // for the cached result instead of stampeding the providers.
-  const lockKey = `pf:sflock:${key}`;
+  const lockKey = ck("sflock", key);
   let lockToken: string | null = null;
   if (redisEnabled()) {
     lockToken = `${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
@@ -367,12 +382,26 @@ function revalidateSoon(
 // ── Public entry point ──────────────────────────────────────────────────────
 
 /**
+ * Phase D (2026-10-09): cache outcome + winning provider for X-Cache /
+ * X-Cache-Provider response headers. Passed as an optional out-param so
+ * callers that don't need it (warm cron, prefetch) are unaffected, and so
+ * concurrent requests on one instance can't race a shared "last status"
+ * variable.
+ */
+export type StreamCacheStatus = "HIT" | "STALE" | "MISS";
+export interface StreamCacheStat {
+  status?: StreamCacheStatus;
+  provider?: string;
+}
+
+/**
  * Cached stream resolution. `live` is the real provider chain — called at
  * most once per cache key per TTL window (coalesced), never on cache hits.
  */
 export async function resolveStreamCached(
   args: StreamArgs,
-  live: () => Promise<ChainResult>
+  live: () => Promise<ChainResult>,
+  stat?: StreamCacheStat
 ): Promise<ChainResult> {
   const key = streamCacheKey(args.type, args.tmdbId, args.season, args.episode, args.audio);
   const rkey = redisKeyFor(key);
@@ -391,17 +420,30 @@ export async function resolveStreamCached(
   if (env) {
     if (now < env.freshUntil) {
       stats.hits++;
+      if (stat) {
+        stat.status = "HIT";
+        stat.provider = env.result?.provider;
+      }
       return { ...env.result, alternates: env.alternates ?? [] };
     }
     if (now < env.staleUntil) {
       stats.stale++;
       revalidateSoon(key, rkey, live);
+      if (stat) {
+        stat.status = "STALE";
+        stat.provider = env.result?.provider;
+      }
       return { ...env.result, alternates: env.alternates ?? [] };
     }
   }
   stats.misses++;
   try {
-    return await resolveLiveSingleflight(key, rkey, live);
+    const r = await resolveLiveSingleflight(key, rkey, live);
+    if (stat) {
+      stat.status = "MISS";
+      stat.provider = r?.provider;
+    }
+    return r;
   } catch (e) {
     // Record content misses only — transient failures (network, 429, 5xx,
     // deadline) must NEVER look permanent.

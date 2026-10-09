@@ -48,3 +48,23 @@ export function cacheDel(key: string): void {
 export function cacheStats(): { entries: number } {
   return { entries: store.size };
 }
+
+// ── Phase D (2026-10-09): versioned shared-cache namespace ─────────────────
+// All Redis-shared cache keys live under `pf:v{N}:...` so a schema change is
+// one constant bump — old keys orphan-expire (≤24h), never FLUSHDB (that
+// would wipe rate limits + the device registry). Operational/security state
+// (pf:dev:*, pf:revoked, pf:cooldown:*, pf:report:*, pf:dead:*, pf:kill:*,
+// pf:tb:*, pf:rl:*, pf:backstop:*) is NOT versioned — it is not cache.
+// CACHE_SCHEMA_OVERRIDE lets ops bump the schema via env without a code
+// change; it is read hot on every key build (no redeploy needed).
+export const CACHE_SCHEMA = 3;
+
+function cacheSchema(): number {
+  const o = parseInt(process.env.CACHE_SCHEMA_OVERRIDE || "", 10);
+  return Number.isFinite(o) && o > 0 ? o : CACHE_SCHEMA;
+}
+
+/** Versioned shared-cache key: `pf:v3:{domain}:{parts...}` (lowercased). */
+export function ck(domain: string, ...parts: (string | number)[]): string {
+  return `pf:v${cacheSchema()}:${domain}:${parts.join(":")}`.toLowerCase();
+}

@@ -22,6 +22,7 @@ import { tmdb } from "../tmdb.js";
 import { redisEnabled, redisCacheGet, redisCacheSet, redisCommand } from "../security/redis.js";
 import { acquirePace, pacerStats } from "../pacer.js";
 import { humanPause } from "../humanize.js";
+import { ck } from "../cache.js";
 
 const WRAPPER = (process.env.MB_WRAPPER_BASE || "https://moviebox-fastapi.vercel.app").replace(/\/$/, "");
 const FETCH_TIMEOUT_MS = 8000; // wrapper p95 unmeasured — conservative
@@ -57,7 +58,8 @@ function composeSignal(external?: AbortSignal): AbortSignal {
 }
 
 // ── Negative cache (catalog gaps — don't re-hit dead titles) ────────────────
-const negKey = (k: string) => `pf:mbneg:${k}`;
+// Phase D (2026-10-09): versioned key pf:v3:mbneg:*.
+const negKey = (k: string) => ck("mbneg", k);
 
 async function negGet(k: string): Promise<boolean> {
   if (!redisEnabled()) return false;
@@ -80,13 +82,16 @@ async function negSet(k: string): Promise<void> {
 // ── MovieBox-Hindi language verdict (P1 2026-10-09) ──────────────────────
 // The dub button (/languages) must know about MovieBox Hindi without
 // live-probing the wrapper on every info-screen open. This verdict cache
-// (24h, matching the pf:mbneg catalog-gap cadence) is written "1" when a
+// (24h, matching the pf:v3:mbneg catalog-gap cadence) is written "1" when a
 // chain win/alternate or a probe proves MovieBox has Hindi for a title,
 // "0" when a probe proves it doesn't. Cheap Redis read, shared api1+api2.
-// The 6h pf:lang envelope stays the primary throttle — this key only guards
+// The 12h pf:v3:lang envelope stays the primary throttle — this key only guards
 // the probe path underneath it.
 const MBHILANG_TTL_S = 24 * 3600;
-const mbhilangKey = (tmdbId: string): string => `pf:mbhilang:movie:${tmdbId}`;
+// Phase D (2026-10-09): versioned key pf:v3:mbhilang:movie:{id}. Exported so
+// the report route evicts the identical key.
+/** Shared MovieBox-Hindi verdict key (exported for the report route). Never throws. */
+export const mbhilangKey = (tmdbId: string): string => ck("mbhilang", "movie", tmdbId);
 
 /** Record the MovieBox-Hindi verdict for a movie. Never throws. */
 export async function noteMovieboxHindi(tmdbId: string, found: boolean): Promise<void> {

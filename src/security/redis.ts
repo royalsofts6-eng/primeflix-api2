@@ -30,13 +30,42 @@ export function redisEnabled(): boolean {
   return redisUrl().length > 0 && redisToken().length > 0;
 }
 
+// ── Phase D (2026-10-09): Redis-failure circuit breaker ─────────────────────
+// After 5 consecutive Redis errors (network fail, timeout, Upstash 429
+// quota-exhausted, or a JSON error), stop calling Redis for 60s and fail
+// open immediately. Rationale: when the quota is exhausted, every extra
+// HTTP round-trip is pure waste (and adds latency); when Redis is down, the
+// breaker stops the latency pile-up. Callers already treat null as
+// "Redis unavailable", so this is behavior-preserving — only faster.
+let consecRedisFails = 0;
+let redisCoolUntil = 0;
+const REDIS_CB_FAILS = 5;
+const REDIS_CB_COOLDOWN_MS = 60_000;
+
+function redisCoolingDown(): boolean {
+  return Date.now() < redisCoolUntil;
+}
+
+/** Observability for /health. Never throws. */
+export function redisCircuitState(): { circuitOpen: boolean; consecFails: number } {
+  return { circuitOpen: redisCoolingDown(), consecFails: consecRedisFails };
+}
+
 /** Raw command via Upstash REST. Returns parsed `result` or null on error. */
 export async function redisCommand(
   args: (string | number)[]
 ): Promise<unknown> {
   if (!redisEnabled()) return null;
+  if (redisCoolingDown()) return null; // fail open, skip the HTTP round-trip
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), REDIS_TIMEOUT_MS);
+  const fail = (): null => {
+    consecRedisFails++;
+    if (consecRedisFails >= REDIS_CB_FAILS) {
+      redisCoolUntil = Date.now() + REDIS_CB_COOLDOWN_MS;
+    }
+    return null;
+  };
   try {
     const res = await fetch(redisUrl(), {
       method: "POST",
@@ -47,22 +76,29 @@ export async function redisCommand(
       body: JSON.stringify(args.map(String)),
       signal: ctrl.signal,
     });
-    if (!res.ok) return null;
+    if (!res.ok) return fail();
     const json = (await res.json()) as { result?: unknown; error?: string };
-    if (json.error) return null;
+    if (json.error) return fail();
+    consecRedisFails = 0;
     return json.result ?? null;
   } catch {
-    return null;
+    return fail();
   } finally {
     clearTimeout(t);
   }
 }
 
-/** Health probe for /health — { enabled, ok }. */
-export async function redisHealth(): Promise<{ enabled: boolean; ok: boolean }> {
-  if (!redisEnabled()) return { enabled: false, ok: false };
+/** Health probe for /health — { enabled, ok, circuitOpen, consecFails }. */
+export async function redisHealth(): Promise<{
+  enabled: boolean;
+  ok: boolean;
+  circuitOpen: boolean;
+  consecFails: number;
+}> {
+  if (!redisEnabled()) return { enabled: false, ok: false, circuitOpen: false, consecFails: 0 };
   const r = await redisCommand(["PING"]);
-  return { enabled: true, ok: r === "PONG" };
+  const c = redisCircuitState();
+  return { enabled: true, ok: r === "PONG", ...c };
 }
 
 // ── Combined rate check: token bucket + fixed window, ONE atomic EVAL ──────
