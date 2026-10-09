@@ -17,6 +17,7 @@ import { cacheStats } from "../src/cache.js";
 import { streamCacheStats, streamCacheKey } from "../src/streamcache.js";
 import { warmTrendingStreams, warmFZMoviesBatch } from "../src/warm.js";
 import { redisCommand } from "../src/security/redis.js";
+import { cacheDel } from "../src/cache.js";
 import { getSeries, getSeasons, getEpisodesForSerie, getStreamUrl, NIAZI_TTL } from "../src/niazitv.js";
 import { getChannels, refreshChannels, groupByCategory, hideDead, pendingChannels } from "../src/livetv.js";
 import { securityStats } from "../src/security/stats.js";
@@ -392,8 +393,22 @@ export default async function handler(req: any, res: any) {
         return send(res, 200, ok({ evicted: false, reason: "already-reported-this-hour" }));
       }
       await redisCommand(["DEL", rkey]).catch(() => null);
+      // Drop this instance's in-memory stream envelope too — otherwise it
+      // keeps serving the dead envelope from memory for up to its TTL even
+      // though Redis was evicted (2026-10-09).
+      cacheDel(streamCacheKey(type, id, season, episode, audio));
       if (b.reason === "hindi_no_longer_available") {
-        await redisCommand(["DEL", `pf:lang:${type}:${id}:${season ?? 0}:${episode ?? 0}`]).catch(() => null);
+        const langKey = `pf:lang:${type}:${id}:${season ?? 0}:${episode ?? 0}`;
+        await redisCommand(["DEL", langKey]).catch(() => null);
+        // Same memory-drop for the lang entry (chain.ts caches pf:lang:*
+        // in-memory under the identical key).
+        cacheDel(langKey);
+        // The MovieBox-Hindi verdict may be stale now too (the dub is
+        // reported gone) — drop it so the next /languages re-probes
+        // instead of trusting yesterday's "1" for 24h.
+        if (type === "movie") {
+          await redisCommand(["DEL", `pf:mbhilang:movie:${id}`]).catch(() => null);
+        }
       }
       return send(res, 200, ok({ evicted: true }));
     }
