@@ -9,9 +9,11 @@ import {
   providerHealth,
   providerCooldowns,
   cachedAvailableAudio,
+  prefetchStreamOnDetail,
   wrapperStatus,
   RACE_MODE,
 } from "../src/chain.js";
+import { NotAvailableError } from "../src/providers/types.js";
 import { raceStats } from "../src/race.js";
 import { warmFZMovies, fzStats } from "../src/providers/fzmovies.js";
 import { cacheStats } from "../src/cache.js";
@@ -313,6 +315,10 @@ export default async function handler(req: any, res: any) {
       const id = tmdbId(m[1]);
       if (!id) return send(res, 400, fail("invalid tmdb id", "BAD_QUERY"));
       const info = await cachedAvailableAudio(id, "movie");
+      // Win #3 (2026-10-09): the dub button fires on every detail-screen
+      // open — fire-and-forget warm the stream cache so Play is instant.
+      // Never blocks this response.
+      prefetchStreamOnDetail("movie", id, undefined, undefined, info.playing);
       return send(res, 200, ok({ audio: info.audio, original: info.original, playing: info.playing, labels: info.labels }), { "Cache-Control": "no-store" });
     }
     if ((m = path.match(/^\/v1\/stream\/tv\/([^/]+)\/([^/]+)\/([^/]+)\/languages$/))) {
@@ -324,6 +330,8 @@ export default async function handler(req: any, res: any) {
         return send(res, 400, fail("invalid season/episode (expected season 1-100, episode 1-500)", "BAD_QUERY"));
       }
       const info = await cachedAvailableAudio(id, "tv", season, episode);
+      // Win #3 (2026-10-09): same prefetch writer for series episodes.
+      prefetchStreamOnDetail("tv", id, season, episode, info.playing);
       return send(res, 200, ok({ audio: info.audio, original: info.original, playing: info.playing, labels: info.labels }), { "Cache-Control": "no-store" });
     }
 
@@ -519,7 +527,18 @@ export default async function handler(req: any, res: any) {
     let code = "UPSTREAM_ERROR";
     let status = 500;
     let error = msg; // P2-2-style: some errors get a plain-language message
-    if (e instanceof ChainDeadlineError) {
+    const headers: Record<string, string> = {};
+    if (e instanceof NotAvailableError) {
+      // Win #2 (2026-10-09): honest fast-fail — a recent attempt already
+      // proved no source has this title. 404 (not 502) so the app's retry
+      // interceptor doesn't re-fire a known-dead title.
+      code = "NOT_AVAILABLE";
+      status = 404;
+      error = "This title is not available on any source right now";
+      if ((e as unknown as { negCacheHit?: boolean }).negCacheHit) {
+        headers["X-Cache"] = "NEG";
+      }
+    } else if (e instanceof ChainDeadlineError) {
       // P0-1 (2026-10-09): the 45s chain deadline fired — honest fast
       // failure instead of a hung connection (Vercel would hard-kill at
       // 60s with no response at all). The client should retry; a stale
@@ -555,6 +574,6 @@ export default async function handler(req: any, res: any) {
       code = "UPSTREAM_ERROR";
       status = upstream >= 400 && upstream < 500 ? upstream : 502;
     }
-    return send(res, status, fail(error, code));
+    return send(res, status, fail(error, code), headers);
   }
 }

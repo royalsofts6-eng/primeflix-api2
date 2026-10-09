@@ -27,8 +27,9 @@
  * "hindi dubbed not available") are NEVER cached.
  */
 import { redisEnabled, redisCacheGet, redisCacheSet, redisCommand } from "./security/redis.js";
-import { cacheGet, cacheSet } from "./cache.js";
+import { cacheGet, cacheSet, cacheDel } from "./cache.js";
 import { background } from "./revalidate.js";
+import { NotAvailableError } from "./providers/types.js";
 import type { ChainResult } from "./chain.js";
 import type { RankedAlternate } from "./race.js";
 
@@ -76,7 +77,84 @@ interface StreamCacheEnvelope {
   staleUntil: number; // epoch ms
 }
 
-const stats = { hits: 0, misses: 0, stale: 0, coalesced: 0, sets: 0 };
+const stats = { hits: 0, misses: 0, stale: 0, coalesced: 0, sets: 0, neg: 0 };
+
+/** Win #2 (2026-10-09): negative cache — a recent all-sources-miss for this
+ * key short-circuits BEFORE the provider race (incl. the MovieBox wrapper
+ * leg with its ~15s pacer wait). TTL 30min: a newly added dub is invisible
+ * for at most 30min, vs. re-running the full race on every request.
+ * Only CONTENT misses are recorded here — transient failures (network,
+ * 429, 5xx, deadline) are never negative-cached (outage confusion).
+ */
+const NEG_TTL_S = 30 * 60;
+const NEG_TTL_MS = NEG_TTL_S * 1000;
+
+interface NegEntry {
+  v: 1;
+  reason: string;
+  at: number;
+}
+
+const negRedisKey = (key: string): string => `pf:neg:${key}`;
+const negMemKey = (key: string): string => `pf:negmem:${key}`;
+
+/** True when the error is a content miss (safe to negative-cache). Never throws. */
+function isContentMissError(e: unknown): boolean {
+  if (e instanceof NotAvailableError) return true;
+  // ChainContentMissError (chain.ts) — duck-typed to avoid a module cycle
+  // (chain.ts imports this file at runtime).
+  return !!(e && typeof e === "object" && (e as { contentMiss?: unknown }).contentMiss === true);
+}
+
+async function negWrite(key: string, reason: string): Promise<void> {
+  const entry: NegEntry = { v: 1, reason: reason.slice(0, 200), at: Date.now() };
+  cacheSet(negMemKey(key), entry, NEG_TTL_MS, 0);
+  if (!redisEnabled()) return;
+  try {
+    await redisCacheSet(negRedisKey(key), entry, NEG_TTL_S);
+  } catch {
+    /* best-effort */
+  }
+}
+
+async function negClear(key: string): Promise<void> {
+  cacheDel(negMemKey(key));
+  if (!redisEnabled()) return;
+  try {
+    await redisCommand(["DEL", negRedisKey(key)]);
+  } catch {
+    /* best-effort */
+  }
+}
+
+async function negRead(key: string): Promise<NegEntry | null> {
+  const mem = cacheGet<NegEntry>(negMemKey(key));
+  if (mem && mem.value.v === 1) return mem.value;
+  if (!redisEnabled()) return null;
+  try {
+    const r = await redisCacheGet<NegEntry>(negRedisKey(key));
+    if (r && r.v === 1) {
+      // Backfill instance memory with the remaining TTL.
+      cacheSet(negMemKey(key), r, NEG_TTL_MS, 0);
+      return r;
+    }
+  } catch {
+    /* fail-open */
+  }
+  return null;
+}
+
+/**
+ * True when a recent attempt already proved this title+audio has no stream
+ * (content miss). Used by the prefetch writer to skip dead titles. Never throws.
+ */
+export async function isNegativelyCached(args: StreamArgs): Promise<boolean> {
+  try {
+    return (await negRead(streamCacheKey(args.type, args.tmdbId, args.season, args.episode, args.audio))) !== null;
+  } catch {
+    return false;
+  }
+}
 
 /** Stats for /health. */
 export function streamCacheStats(): Record<string, number> {
@@ -135,6 +213,9 @@ async function writeEnvelope(key: string, rkey: string, result: ChainResult): Pr
     await redisCacheSet(rkey, env, ttlS + STALE_WINDOW_S);
   }
   stats.sets++;
+  // A success proves the title is servable — drop any stale negativity
+  // (e.g. a dub added after the negative entry was written).
+  await negClear(key);
 }
 
 /** True when a FRESH (non-stale) entry exists — used by the pre-warm cron. */
@@ -285,6 +366,16 @@ export async function resolveStreamCached(
 ): Promise<ChainResult> {
   const key = streamCacheKey(args.type, args.tmdbId, args.season, args.episode, args.audio);
   const rkey = redisKeyFor(key);
+  // Win #2: negative cache BEFORE the envelope read, the race, and the
+  // pacer — a recent content miss answers honestly in <1s with ONE Redis
+  // read instead of re-running the full provider chain.
+  const neg = await negRead(key);
+  if (neg) {
+    stats.neg++;
+    const err = new NotAvailableError(`${neg.reason} (checked recently)`);
+    (err as unknown as { negCacheHit: boolean }).negCacheHit = true;
+    throw err;
+  }
   const env = await readEnvelope(key, rkey);
   const now = Date.now();
   if (env) {
@@ -299,5 +390,14 @@ export async function resolveStreamCached(
     }
   }
   stats.misses++;
-  return resolveLiveSingleflight(key, rkey, live);
+  try {
+    return await resolveLiveSingleflight(key, rkey, live);
+  } catch (e) {
+    // Record content misses only — transient failures (network, 429, 5xx,
+    // deadline) must NEVER look permanent.
+    if (isContentMissError(e)) {
+      await negWrite(key, e instanceof Error ? e.message : "not available");
+    }
+    throw e;
+  }
 }

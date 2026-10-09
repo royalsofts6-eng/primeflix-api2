@@ -38,7 +38,7 @@ import {
 } from "./providers/failures.js";
 import { redisEnabled, redisCacheGet, redisCacheSet, redisCommand } from "./security/redis.js";
 import { cacheGet, cacheSet } from "./cache.js";
-import { cachedStreamProviders, resolveStreamCached } from "./streamcache.js";
+import { cachedStreamProviders, resolveStreamCached, isStreamCachedFresh, isNegativelyCached } from "./streamcache.js";
 import {
   raceTier,
   rankAlternates,
@@ -261,6 +261,40 @@ export class ChainDeadlineError extends Error {
     this.name = "ChainDeadlineError";
     this.elapsedMs = elapsedMs;
   }
+}
+
+/**
+ * Win #2 (2026-10-09): terminal CONTENT miss — every lane raced and nothing
+ * was found, with no transient failure in the mix. streamcache.ts
+ * negative-caches exactly this class for 30min (fail-fast on dead titles);
+ * anything else (plain Error) is treated as possibly-transient and is never
+ * negative-cached.
+ */
+export class ChainContentMissError extends Error {
+  readonly contentMiss = true;
+  constructor(message: string) {
+    super(message);
+    this.name = "ChainContentMissError";
+  }
+}
+
+/**
+ * True when every recorded lane error is a content miss (no qualities /
+ * content-miss / not-available) with NO transient signal (429, pacer
+ * congestion, timeout, network, 5xx, key-death, abort). A miss-only chain
+ * means the catalog genuinely lacks the title — safe to negative-cache.
+ */
+const CONTENT_MISS_RE = /no qualities|content-miss|not-available|not available/i;
+const TRANSIENT_RE =
+  /429|rate.?limit|pacer|timed? ?out|timeout|network|econn|socket|refused|dns|key-death|forbidden|not_found|abort|upstream|5\d\d/i;
+
+function allContentMiss(errors: TierError[]): boolean {
+  return (
+    errors.length > 0 &&
+    errors.every(
+      (e) => CONTENT_MISS_RE.test(e.reason) && !TRANSIENT_RE.test(e.reason)
+    )
+  );
 }
 
 /** Race mode: "speed" (first success wins) or "quality" (best of the lane). */
@@ -540,6 +574,19 @@ export async function resolveStreamLive(
   const describeErrors = (): string =>
     laneErrors.map((x) => `${x.provider}: ${x.reason}`).join(", ");
 
+  /**
+   * Terminal chain error. Win #2: classified — a miss-only chain (no
+   * transient failure anywhere) becomes a ChainContentMissError, which
+   * streamcache.ts negative-caches for 30min; anything with a transient
+   * signal stays a plain Error and is never cached.
+   */
+  const terminalError = (): Error => {
+    const msg = `all providers failed (${describeErrors() || "no reason recorded"})`;
+    return allContentMiss(laneErrors)
+      ? new ChainContentMissError(msg)
+      : new Error(msg);
+  };
+
   // Explicit Hindi request: L1 only.
   // Explicit English request: L2 only.
   // Omitted: Hindi-first across all four sources.
@@ -561,7 +608,7 @@ export async function resolveStreamLive(
         if (vl) return win(vl);
       }
       throwIfDeadline();
-      throw new Error("hindi dubbed not available");
+      throw new ChainContentMissError("hindi dubbed not available");
     }
 
     if (audio === "en") {
@@ -571,7 +618,7 @@ export async function resolveStreamLive(
       const mb = await wrapperTier("moviebox", moviebox, tmdbId, type, season, episode, dsignal);
       if (mb) return win(mb);
       throwIfDeadline();
-      throw new Error(`all providers failed (${describeErrors() || "no reason recorded"})`);
+      throw terminalError();
     }
 
     // Default: Hindi-first across all four sources.
@@ -581,13 +628,24 @@ export async function resolveStreamLive(
     const dmb = await wrapperTier("moviebox-hi", movieboxHindi, tmdbId, type, season, episode, dsignal);
     if (dmb) return win(dmb);
     throwIfDeadline();
+    // Win #5 (2026-10-09, Ali approved): the Hindi wrapper leg writes a 24h
+    // catalog-gap negative key (pf:mbneg:hi:{tmdbId}) when the wrapper
+    // catalog lacks the title. The English leg searches the SAME wrapper
+    // catalog, so a gap there predicts a gap here — skip the second paced
+    // wrapper call (~2–10s saved) and go straight to L2 / honest error.
+    // Transient failures set no neg key, so the en tier still runs when the
+    // hi leg failed for network/server reasons. TV titles never set the hi
+    // neg key (wrapper is movies-only), so TV behavior is unchanged.
+    const mbEnCatalogGap = await movieboxHindiKnownMissing(tmdbId);
     const d2 = await runLane(ENGLISH_LANE, ENGLISH_LANE_BUDGET_MS, dsignal);
     if (d2) return win(d2);
     throwIfDeadline();
-    const dmb2 = await wrapperTier("moviebox", moviebox, tmdbId, type, season, episode, dsignal);
-    if (dmb2) return win(dmb2);
-    throwIfDeadline();
-    throw new Error(`all providers failed (${describeErrors() || "no reason recorded"})`);
+    if (!mbEnCatalogGap) {
+      const dmb2 = await wrapperTier("moviebox", moviebox, tmdbId, type, season, episode, dsignal);
+      if (dmb2) return win(dmb2);
+      throwIfDeadline();
+    }
+    throw terminalError();
   } finally {
     clearTimeout(deadlineTimer);
   }
@@ -610,6 +668,56 @@ export async function resolveStream(
 ): Promise<ChainResult> {
   return resolveStreamCached({ tmdbId, type, season, episode, audio }, () =>
     resolveStreamLive(tmdbId, type, season, episode, audio)
+  );
+}
+
+/**
+ * Win #3 (2026-10-09): stream prefetch WRITER. The app opens the detail
+ * screen (and its dub button) before the user taps Play — the /languages
+ * routes call this to fire-and-forget warm the stream cache for the lanes
+ * Play will actually use: the default Hindi-first lane, plus the audio the
+ * dub button says will play (when it is an explicit hi/en lane).
+ *
+ * Low priority, never blocks the response:
+ *  - skips when the envelope is already fresh (1 cheap read) or the title
+ *    is negatively cached (dead titles are never re-raced),
+ *  - sequential legs (pacer-friendly: the wrapper leg is never in a race),
+ *  - each leg still obeys the chain's 45s deadline,
+ *  - runs via background()/waitUntil so the response returns immediately,
+ *  - best-effort: every failure is swallowed, the live path is untouched.
+ */
+export function prefetchStreamOnDetail(
+  type: "movie" | "tv",
+  tmdbId: string,
+  season?: number,
+  episode?: number,
+  playingAudio?: string
+): void {
+  const audios: (string | undefined)[] = [undefined];
+  if (playingAudio === "hi" || playingAudio === "en") audios.push(playingAudio);
+  background(
+    (async (): Promise<void> => {
+      try {
+        for (const audio of audios) {
+          if (
+            await isNegativelyCached({ type, tmdbId, season, episode, audio })
+          ) {
+            continue; // dead title — don't warm what Play can't use
+          }
+          if (
+            await isStreamCachedFresh(type, tmdbId, season, episode, audio)
+          ) {
+            continue; // already warm — nothing to do
+          }
+          await resolveStreamCached(
+            { type, tmdbId, season, episode, audio },
+            () => resolveStreamLive(tmdbId, type, season, episode, audio)
+          );
+        }
+      } catch {
+        /* prefetch is best-effort — the live Play path is unaffected */
+      }
+    })()
   );
 }
 
