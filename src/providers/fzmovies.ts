@@ -146,8 +146,13 @@ function norm(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 }
 
-/** Score a hit: Hindi slug + title similarity + year match. Higher = better. */
-function scoreHit(hit: SearchHit, title: string, year: string): number {
+/** Score a hit: Hindi slug + title similarity + year match. Higher = better.
+ * Exported for unit tests. */
+export function scoreHit(hit: SearchHit, title: string, year: string): number {
+  // P1-9 (2026-10-10): HARD year gate — a wrong sequel/remake used to win on
+  // title overlap (+20 year bonus only) and get cached 10h. When both years
+  // are known and differ, reject outright. A missing hit year can't gate.
+  if (year && hit.year && hit.year !== year) return -1000;
   let score = 0;
   const nTitle = norm(title);
   const nLabel = norm(hit.label);
