@@ -385,7 +385,7 @@ const CONTENT_MISS_RE = /no qualities|content-miss|null body|not-available|not a
 const TRANSIENT_RE =
   /429|rate.?limit|pacer|timed? ?out|timeout|network|econn|socket|refused|dns|key-death|forbidden|not_found|abort|upstream|5\d\d/i;
 
-/** Exported for unit tests (p0p1p2-fixes). */
+/** Exported for unit tests. */
 export function allContentMiss(errors: TierError[]): boolean {
   return (
     errors.length > 0 &&
@@ -393,6 +393,20 @@ export function allContentMiss(errors: TierError[]): boolean {
       (e) => CONTENT_MISS_RE.test(e.reason) && !TRANSIENT_RE.test(e.reason)
     )
   );
+}
+
+/**
+ * P1-11 (2026-10-10): the Hindi-miss error, classified. A genuine content
+ * miss (no transient signal anywhere — catalog gaps, not-available) ->
+ * ChainContentMissError, which streamcache negative-caches for 30min. ANY
+ * transient signal (pacer congestion/timeout, network, 429, 5xx, aborts) ->
+ * plain Error: NEVER cached as a content miss, and the route maps it to an
+ * honest 502 (retryable) instead of 404.
+ */
+function hindiMissError(errors: TierError[]): Error {
+  if (allContentMiss(errors)) return new ChainContentMissError("hindi dubbed not available");
+  const detail = errors.map((e) => `${e.provider}: ${e.reason}`).join(", ") || "no reason recorded";
+  return new Error(`hindi dubbed request failed transiently (upstream timeout/congestion) [${detail}]`);
 }
 
 /** Race mode: "speed" (first success wins) or "quality" (best of the lane). */
@@ -866,7 +880,9 @@ export async function resolveStreamLive(
         const mb = await movieboxFirst("moviebox-hi", movieboxHindi, tmdbId, type, season, episode, dsignal, MB_TV_TIMEOUT_MS, mbErrs);
         if (mb) return win(mb);
         throwIfDeadline();
-        throw new ChainContentMissError("hindi dubbed not available");
+        // P1-11: a pacer timeout / transient here must NOT become a cached
+        // "hindi dubbed not available" — classify first.
+        throw hindiMissError(mbErrs);
       }
       if (audio === "en") {
         const mb = await movieboxFirst("moviebox", moviebox, tmdbId, type, season, episode, dsignal, MB_TV_TIMEOUT_MS);
@@ -889,8 +905,9 @@ export async function resolveStreamLive(
     }
     if (audio === "hi") {
       // Ali 2026-10-10: MovieBox first — most accurate catalog kills the
-      // wrong-movie problem. 5s window, then the Hindi lane races.
-      const mbFirst = await movieboxFirst("moviebox-hi", movieboxHindi, tmdbId, type, season, episode, dsignal);
+      // wrong-movie problem. 8s window, then the Hindi lane races.
+      const mbHiErrs: TierError[] = [];
+      const mbFirst = await movieboxFirst("moviebox-hi", movieboxHindi, tmdbId, type, season, episode, dsignal, MOVIEBOX_FIRST_TIMEOUT_MS, mbHiErrs);
       if (mbFirst) return win(mbFirst);
       throwIfDeadline();
       const h1 = await runLane(HINDI_LANE, HINDI_LANE_BUDGET_MS, dsignal);
@@ -899,12 +916,18 @@ export async function resolveStreamLive(
       // Bollywood/Hindi-original titles: VidLink serves the Hindi ORIGINAL, so
       // ?audio=hi is satisfiable even with no dubbed copy (Ali 2026-10-08:
       // Drishyam showed "English" — the original IS Hindi).
+      const vlErrs: TierError[] = [];
       if ((await originalLanguage(tmdbId, type)) === "hi" && !(await providerBlocked("vidlink"))) {
-        const vl = await tryProvider({ name: "vidlink", fn: vidlink }, tmdbId, type, season, episode, () => true, { signal: dsignal });
+        const vl = await tryProvider({ name: "vidlink", fn: vidlink }, tmdbId, type, season, episode, () => true, {
+          signal: dsignal,
+          onError: (p, r) => vlErrs.push({ provider: p, reason: r }),
+        });
         if (vl) return win(vl);
       }
       throwIfDeadline();
-      throw new ChainContentMissError("hindi dubbed not available");
+      // P1-11: classify — a pacer timeout / blocked provider here must NOT
+      // be cached 30min as "hindi dubbed not available".
+      throw hindiMissError([...mbHiErrs, ...laneErrors, ...vlErrs]);
     }
 
     if (audio === "en") {
