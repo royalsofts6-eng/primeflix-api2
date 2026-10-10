@@ -543,9 +543,7 @@ export default async function handler(req: any, res: any) {
         // The MovieBox-Hindi verdict may be stale now too (the dub is
         // reported gone) — drop it so the next /languages re-probes
         // instead of trusting yesterday's "1" for 24h.
-        if (type === "movie") {
-          await redisCommand(["DEL", mbhilangKey(id)]).catch(() => null);
-        }
+        await redisCommand(["DEL", mbhilangKey(id, type === "tv" ? "tv" : "movie")]).catch(() => null);
       }
       return send(res, 200, ok({ evicted: true, deadReportsToday: deadCount }));
     }

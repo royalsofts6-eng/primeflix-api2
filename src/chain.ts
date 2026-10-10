@@ -605,10 +605,14 @@ async function movieboxFirst(
   type: "movie" | "tv",
   season?: number,
   episode?: number,
-  /** The chain's 45s deadline signal — combined with the 5s first-window. */
-  parentSignal?: AbortSignal
+  /** The chain's 45s deadline signal — combined with the first-window. */
+  parentSignal?: AbortSignal,
+  /** Head-start window. Movies: 5s (lanes follow on miss). TV: 15s — no
+   *  fallback exists, so the paced wrapper leg gets room (still under the
+   *  45s chain deadline). */
+  timeoutMs: number = MOVIEBOX_FIRST_TIMEOUT_MS
 ): Promise<ProviderResult | null> {
-  const firstWindow = AbortSignal.timeout(MOVIEBOX_FIRST_TIMEOUT_MS);
+  const firstWindow = AbortSignal.timeout(timeoutMs);
   const signal = parentSignal
     ? AbortSignal.any([parentSignal, firstWindow])
     : firstWindow;
@@ -687,12 +691,12 @@ export async function resolveStreamLive(
     // P1 (2026-10-09): MovieBox-Hindi language verdict — a moviebox-hi win
     // (or alternate) proves Hindi exists for this title, so /languages can
     // later answer from chain state instead of live-probing the wrapper.
-    // Fire-and-forget, best-effort.
+    // Fire-and-forget, best-effort. Movies AND TV (Ali 2026-10-10: series
+    // stream MovieBox-only, so the verdict keeps the TV dub button honest).
     if (
-      type === "movie" &&
-      (r.provider === "moviebox-hi" || alternates.some((a) => a.provider === "moviebox-hi"))
+      r.provider === "moviebox-hi" || alternates.some((a) => a.provider === "moviebox-hi")
     ) {
-      void noteMovieboxHindi(tmdbId, true);
+      void noteMovieboxHindi(tmdbId, true, type);
     }
     return {
       ...r,
@@ -724,6 +728,34 @@ export async function resolveStreamLive(
   // P0-1: the whole dispatch runs under the 45s deadline timer (cleared in
   // the finally below, whichever lane path wins or throws).
   try {
+    // Ali 2026-10-10: SERIES ONLY FROM MOVIEBOX. Other sources caused
+    // wrong-content problems (wrong show playing for an episode). No lane
+    // fallback — a MovieBox miss is an honest error. 15s window: there is
+    // no fallback to fall through to, so the paced wrapper leg gets room
+    // (still under the 45s chain deadline).
+    if (type === "tv") {
+      const MB_TV_TIMEOUT_MS = 15000;
+      if (audio === "hi") {
+        const mb = await movieboxFirst("moviebox-hi", movieboxHindi, tmdbId, type, season, episode, dsignal, MB_TV_TIMEOUT_MS);
+        if (mb) return win(mb);
+        throwIfDeadline();
+        throw new ChainContentMissError("hindi dubbed not available");
+      }
+      if (audio === "en") {
+        const mb = await movieboxFirst("moviebox", moviebox, tmdbId, type, season, episode, dsignal, MB_TV_TIMEOUT_MS);
+        if (mb) return win(mb);
+        throwIfDeadline();
+        throw terminalError();
+      }
+      // Default: Hindi-first, MovieBox only.
+      const mbHi = await movieboxFirst("moviebox-hi", movieboxHindi, tmdbId, type, season, episode, dsignal, MB_TV_TIMEOUT_MS);
+      if (mbHi) return win(mbHi);
+      throwIfDeadline();
+      const mbEn = await movieboxFirst("moviebox", moviebox, tmdbId, type, season, episode, dsignal, MB_TV_TIMEOUT_MS);
+      if (mbEn) return win(mbEn);
+      throwIfDeadline();
+      throw terminalError();
+    }
     if (audio === "hi") {
       // Ali 2026-10-10: MovieBox first — most accurate catalog kills the
       // wrong-movie problem. 5s window, then the Hindi lane races.
@@ -763,13 +795,12 @@ export async function resolveStreamLive(
     if (d1) return win(d1);
     throwIfDeadline();
     // Win #5 (2026-10-09, Ali approved): the Hindi wrapper leg writes a 24h
-    // catalog-gap negative key (pf:mbneg:hi:{tmdbId}) when the wrapper
-    // catalog lacks the title. The English leg searches the SAME wrapper
-    // catalog, so a gap there predicts a gap here — skip the second wrapper
-    // call and go straight to L2. Transient failures set no neg key, so the
-    // en attempt still runs when the hi leg failed for network/server
-    // reasons. TV titles never set the hi neg key (wrapper is movies-only),
-    // so TV behavior is unchanged.
+    // catalog-gap negative key (pf:mbneg:hi:{tmdbId}, TV: pf:mbneg:hi:tv:{tmdbId})
+    // when the wrapper catalog lacks the title. The English leg searches the
+    // SAME wrapper catalog, so a gap there predicts a gap here — skip the second
+    // wrapper call and go straight to L2. Transient failures set no neg key, so
+    // the en attempt still runs when the hi leg failed for network/server
+    // reasons. (Movies only — the TV dispatch above returns before this point.)
     const mbEnCatalogGap = await movieboxHindiKnownMissing(tmdbId);
     if (!mbEnCatalogGap) {
       const mbEnFirst = await movieboxFirst("moviebox", moviebox, tmdbId, type, season, episode, dsignal);
@@ -914,31 +945,37 @@ function labelFor(code: string): string {
  * (acquire timeout) degrades to "not available": never over-claims, never
  * stampedes. Skipped entirely when the wrapper is killed/disabled or the
  * provider is blocked, so the kill switch keeps /languages honest too.
- * Movies only — the wrapper leg never serves series.
+ * Movies and TV (Ali 2026-10-10: series stream MovieBox-only, so the TV
+ * dub button must reflect MovieBox Hindi, not VidZee/FZMovies).
  */
-async function movieboxHindiAvailable(tmdbId: string): Promise<boolean> {
+async function movieboxHindiAvailable(
+  tmdbId: string,
+  type: "movie" | "tv" = "movie",
+  season?: number,
+  episode?: number
+): Promise<boolean> {
   try {
     if (!(await movieboxLive())) return false;
     if (await providerBlocked("moviebox-hi")) return false;
     // 1. Shared verdict cache (written by chain wins and past probes).
-    const verdict = await movieboxHindiVerdict(tmdbId);
+    const verdict = await movieboxHindiVerdict(tmdbId, type);
     if (verdict !== null) return verdict;
     // 2. 24h negative cache written by chain runs (catalog gaps).
-    if (await movieboxHindiKnownMissing(tmdbId)) {
-      await noteMovieboxHindi(tmdbId, false);
+    if (await movieboxHindiKnownMissing(tmdbId, type)) {
+      await noteMovieboxHindi(tmdbId, false, type);
       return false;
     }
     // 3. Chain state: any cached envelope (default/Hindi audio keys) whose
     //    winner or alternates include moviebox-hi proves Hindi played.
-    const providers = await cachedStreamProviders("movie", tmdbId);
+    const providers = await cachedStreamProviders(type, tmdbId, season, episode);
     if (providers.has("moviebox-hi")) {
-      await noteMovieboxHindi(tmdbId, true);
+      await noteMovieboxHindi(tmdbId, true, type);
       return true;
     }
     // 4. Last resort: ONE paced live probe; the verdict is cached 24h.
-    const r = await movieboxHindi(tmdbId, "movie");
+    const r = await movieboxHindi(tmdbId, type, season, episode);
     const found = !!(r && r.qualities.length > 0);
-    await noteMovieboxHindi(tmdbId, found);
+    await noteMovieboxHindi(tmdbId, found, type);
     return found;
   } catch {
     return false;
@@ -951,10 +988,12 @@ async function movieboxHindiAvailable(tmdbId: string): Promise<boolean> {
  * must show the movie's REAL original language, e.g. Hindi for Bollywood).
  *
  * - The original language is ALWAYS available (VidLink serves the original).
- * - "hi" is added when the original is not Hindi AND VidZee has Hindi-dubbed
- *   (fast check, 7s internal timeout) OR the FZMovies cache has it (instant)
- *   OR MovieBox has Hindi (P1 2026-10-09: verdict cache + chain state first,
- *   one paced live probe as the last resort — movies only).
+ * - "hi" is added when the original is not Hindi AND (movies) VidZee has
+ *   Hindi-dubbed (fast check, 7s internal timeout) OR the FZMovies cache has
+ *   it (instant) OR MovieBox has Hindi (P1 2026-10-09: verdict cache + chain
+ *   state first, one paced live probe as the last resort); (TV, Ali
+ *   2026-10-10) series stream MovieBox-only, so ONLY MovieBox-Hindi counts —
+ *   VidZee/FZMovies are skipped for series.
  * - When the original IS Hindi (e.g. Drishyam), "hi" covers both the original
  *   and any dub — no duplicate entry, no fake "English".
  *
@@ -971,6 +1010,11 @@ export async function availableAudio(
   // Hindi-dub check only matters when the original is not already Hindi.
   let hindiDub = original === "hi";
   if (!hindiDub) {
+    if (type === "tv") {
+      // Ali 2026-10-10: series stream MovieBox-only — the dub button must
+      // reflect MovieBox Hindi availability, never VidZee/FZMovies.
+      hindiDub = await movieboxHindiAvailable(tmdbId, "tv", season, episode);
+    } else {
     const hindiEntry: TierEntry = { name: "vidzee", fn: vidzee };
     const fzEntry: TierEntry = { name: "fzmovies", fn: fzmovies };
 
@@ -999,18 +1043,17 @@ export async function availableAudio(
         }
       })()
     );
-    // MovieBox-Hindi (P1 2026-10-09): the wrapper leg is movies-only, so
-    // series skip it. Verdict-cache-first + paced live probe as the last
-    // resort — /languages stays honest without raising wrapper call volume.
-    if (type === "movie") {
-      checks.push(movieboxHindiAvailable(tmdbId));
-    }
+    // MovieBox-Hindi (P1 2026-10-09): verdict-cache-first + paced live probe
+    // as the last resort — /languages stays honest without raising wrapper
+    // call volume.
+    checks.push(movieboxHindiAvailable(tmdbId));
 
     const results = await Promise.race([
       Promise.all(checks),
       new Promise<boolean[]>((res) => setTimeout(() => res([false]), 8000)),
     ]);
     hindiDub = results.some(Boolean);
+    }
   }
 
   // Hindi-first (Ali's standing rule), then the original. Deduped.

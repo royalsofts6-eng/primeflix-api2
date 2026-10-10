@@ -6,11 +6,15 @@
  * Direct MovieBox API is NOT usable (407 signature-invalid) — wrapper only.
  *
  * CYBER RULES (standing):
- *  1. The wrapper leg is NEVER in a race — chain.ts calls these as a
- *     SEQUENTIAL last tier only.
+ *  1. The wrapper leg is NEVER in a parallel race — chain.ts gives it a
+ *     MovieBox-first 5s head-start window (Ali 2026-10-10), then the lanes.
+ *     The provider itself paces (1 req/5s, max 1 concurrent) and humanizes
+ *     (800–2500ms gaps); the kill switch bypasses instantly.
  *  2. Max 1 concurrent wrapper call — enforced here by the pacer mutex.
  *  3. Kill switch: MOVIEBOX_ENABLED=false (or "0") bypasses instantly,
  *     no redeploy. Redis flag pf:kill:moviebox is the ops-level switch.
+ *  4. Serves movies AND TV series (Ali 2026-10-10) — the wrapper's
+ *     get_stream takes season/episode; subjectType 1=movie, 2=series.
  *
  * Self-policing: every call goes through acquirePace (1 req/5s sustained,
  * burst 4) + a human gap (800–2500ms) before get_stream. 404 "no streaming
@@ -61,6 +65,48 @@ function composeSignal(external?: AbortSignal): AbortSignal {
 // Phase D (2026-10-09): versioned key pf:v3:mbneg:*.
 const negKey = (k: string) => ck("mbneg", k);
 
+// ── MovieBox-Hindi language verdict (P1 2026-10-09) ──────────────────────
+// The dub button (/languages) must know about MovieBox Hindi without
+// live-probing the wrapper on every info-screen open. This verdict cache
+// (24h, matching the pf:v3:mbneg catalog-gap cadence) is written "1" when a
+// chain win/alternate or a probe proves MovieBox has Hindi for a title,
+// "0" when a probe proves it doesn't. Cheap Redis read, shared api1+api2.
+// The 12h pf:v3:lang envelope stays the primary throttle — this key only guards
+// the probe path underneath it.
+// Phase D (2026-10-09): versioned key pf:v3:mbhilang:{type}:{id}. Exported so
+// the report route evicts the identical key. Ali 2026-10-10: TV verdicts
+// namespaced per type (movie/tv).
+const MBHILANG_TTL_S = 24 * 3600;
+/** Shared MovieBox-Hindi verdict key (exported for the report route). Never throws. */
+export const mbhilangKey = (tmdbId: string, type: "movie" | "tv" = "movie"): string =>
+  ck("mbhilang", type, tmdbId);
+
+/** Record the MovieBox-Hindi verdict for a title. Never throws. */
+export async function noteMovieboxHindi(tmdbId: string, found: boolean, type: "movie" | "tv" = "movie"): Promise<void> {
+  if (!redisEnabled()) return;
+  try {
+    await redisCacheSet(mbhilangKey(tmdbId, type), found ? "1" : "0", MBHILANG_TTL_S);
+  } catch {
+    /* best-effort */
+  }
+}
+
+/** Shared verdict read: true/false, or null when unknown. Never throws. */
+export async function movieboxHindiVerdict(tmdbId: string, type: "movie" | "tv" = "movie"): Promise<boolean | null> {
+  if (!redisEnabled()) return null;
+  try {
+    const v = await redisCacheGet<string>(mbhilangKey(tmdbId, type));
+    return v === "1" ? true : v === "0" ? false : null;
+  } catch {
+    return null;
+  }
+}
+
+/** True when a chain run already proved MovieBox has NO Hindi for this title. */
+export async function movieboxHindiKnownMissing(tmdbId: string, type: "movie" | "tv" = "movie"): Promise<boolean> {
+  return negGet(type === "tv" ? `hi:tv:${tmdbId}` : `hi:${tmdbId}`);
+}
+
 async function negGet(k: string): Promise<boolean> {
   if (!redisEnabled()) return false;
   try {
@@ -77,46 +123,6 @@ async function negSet(k: string): Promise<void> {
   } catch {
     /* best-effort */
   }
-}
-
-// ── MovieBox-Hindi language verdict (P1 2026-10-09) ──────────────────────
-// The dub button (/languages) must know about MovieBox Hindi without
-// live-probing the wrapper on every info-screen open. This verdict cache
-// (24h, matching the pf:v3:mbneg catalog-gap cadence) is written "1" when a
-// chain win/alternate or a probe proves MovieBox has Hindi for a title,
-// "0" when a probe proves it doesn't. Cheap Redis read, shared api1+api2.
-// The 12h pf:v3:lang envelope stays the primary throttle — this key only guards
-// the probe path underneath it.
-const MBHILANG_TTL_S = 24 * 3600;
-// Phase D (2026-10-09): versioned key pf:v3:mbhilang:movie:{id}. Exported so
-// the report route evicts the identical key.
-/** Shared MovieBox-Hindi verdict key (exported for the report route). Never throws. */
-export const mbhilangKey = (tmdbId: string): string => ck("mbhilang", "movie", tmdbId);
-
-/** Record the MovieBox-Hindi verdict for a movie. Never throws. */
-export async function noteMovieboxHindi(tmdbId: string, found: boolean): Promise<void> {
-  if (!redisEnabled()) return;
-  try {
-    await redisCacheSet(mbhilangKey(tmdbId), found ? "1" : "0", MBHILANG_TTL_S);
-  } catch {
-    /* best-effort */
-  }
-}
-
-/** Shared verdict read: true/false, or null when unknown. Never throws. */
-export async function movieboxHindiVerdict(tmdbId: string): Promise<boolean | null> {
-  if (!redisEnabled()) return null;
-  try {
-    const v = await redisCacheGet<string>(mbhilangKey(tmdbId));
-    return v === "1" ? true : v === "0" ? false : null;
-  } catch {
-    return null;
-  }
-}
-
-/** True when a chain run already proved MovieBox has NO Hindi for this movie. */
-export async function movieboxHindiKnownMissing(tmdbId: string): Promise<boolean> {
-  return negGet(`hi:${tmdbId}`);
 }
 
 /** Combined liveness: env flag AND the Redis kill switch. Cheap (one Redis GET). */
@@ -162,10 +168,15 @@ async function wrapperSearch(query: string, signal: AbortSignal): Promise<any[]>
 
 /**
  * D1 mapping: "{title} hindi" -> [Hindi]-marked subject, year ±1,
- * subjectType 1 (movie), ≥50% token overlap (D4 junk filter — drops
- * mislabeled uploads like "Cheetah on Fire").
+ * subjectType 1 (movie) / 2 (series), ≥50% token overlap (D4 junk filter —
+ * drops mislabeled uploads like "Cheetah on Fire").
  */
-async function findHindiSubject(title: string, year: number, signal: AbortSignal): Promise<SearchHit | null> {
+async function findHindiSubject(
+  title: string,
+  year: number,
+  signal: AbortSignal,
+  wantSubjectType: "1" | "2"
+): Promise<SearchHit | null> {
   const items = await wrapperSearch(`${title} hindi`, signal);
   let best: SearchHit | null = null;
   let bestScore = 0;
@@ -174,7 +185,7 @@ async function findHindiSubject(title: string, year: number, signal: AbortSignal
     if (!/\[hindi\]|\(hindi\)/i.test(t)) continue; // Hindi marker required
     const y = subjectYear(it);
     if (y && year && Math.abs(y - year) > 1) continue; // year ±1
-    if (String(it.subjectType ?? it.subject_type ?? "1") !== "1") continue; // movie
+    if (String(it.subjectType ?? it.subject_type ?? "1") !== wantSubjectType) continue;
     const score = titleScore(title, t);
     if (score > bestScore && score >= 0.5) {
       const id = subjectIdOf(it);
@@ -188,7 +199,12 @@ async function findHindiSubject(title: string, year: number, signal: AbortSignal
 }
 
 /** Default-resource pick: same similarity gates, no [Hindi] requirement. */
-async function findDefaultSubject(title: string, year: number, signal: AbortSignal): Promise<SearchHit | null> {
+async function findDefaultSubject(
+  title: string,
+  year: number,
+  signal: AbortSignal,
+  wantSubjectType: "1" | "2"
+): Promise<SearchHit | null> {
   const items = await wrapperSearch(title, signal);
   let best: SearchHit | null = null;
   let bestScore = 0;
@@ -196,7 +212,7 @@ async function findDefaultSubject(title: string, year: number, signal: AbortSign
     const t = String(it.title ?? it.name ?? "");
     const y = subjectYear(it);
     if (y && year && Math.abs(y - year) > 1) continue;
-    if (String(it.subjectType ?? it.subject_type ?? "1") !== "1") continue;
+    if (String(it.subjectType ?? it.subject_type ?? "1") !== wantSubjectType) continue;
     const score = titleScore(title, t);
     // Prefer non-Hindi-marked for the English lane, but accept Hindi-marked
     // over nothing (a Bollywood original's default resource IS Hindi).
@@ -225,19 +241,28 @@ function extractQuality(url: string): string {
   return "720p";
 }
 
-async function getStream(subjectId: string, signal: AbortSignal): Promise<ProviderResult | null> {
+async function getStream(
+  subjectId: string,
+  type: "movie" | "tv",
+  season: number,
+  episode: number,
+  signal: AbortSignal
+): Promise<ProviderResult | null> {
+  // TV: one subject serves many episodes — the neg key is per (subject, s, e).
+  // Movies keep the legacy key (backward compatible with the 24h neg cache).
+  const streamNegK = type === "tv" ? `stream:tv:${subjectId}:${season}:${episode}` : `stream:${subjectId}`;
   let res;
   try {
     res = await fetchUpstream(
       "moviebox",
-      `${WRAPPER}/get_stream?subject_id=${encodeURIComponent(subjectId)}&season=0&episode=0`,
+      `${WRAPPER}/get_stream?subject_id=${encodeURIComponent(subjectId)}&season=${season}&episode=${episode}`,
       { signal }
     );
   } catch (e) {
     // 404 "no streaming link" = catalog gap: negative-cache, silent miss.
     // Anything else (5xx, network) rethrows -> chain classifies + counts.
     if (e instanceof ProviderFailure && e.status === 404) {
-      await negSet(`stream:${subjectId}`);
+      await negSet(streamNegK);
       return null;
     }
     throw e;
@@ -288,12 +313,14 @@ async function pacedCall<T>(work: () => Promise<T>, signal?: AbortSignal): Promi
   }
 }
 
-/** L1 Hindi lane's sequential tier (movies only — series Hindi is spotty). */
-export const movieboxHindi: ProviderFn = async (tmdbId, type, _s, _e, opts) => {
+/** L1 Hindi lane's MovieBox tier — movies + TV series (Ali 2026-10-10). */
+export const movieboxHindi: ProviderFn = async (tmdbId, type, s, e, opts) => {
   if (!enabled()) return null;
-  if (type !== "movie") return null;
   if (!(await wrapperAlive())) return null;
-  const negK = `hi:${tmdbId}`;
+  const season = s ?? 1;
+  const episode = e ?? 1;
+  // TV neg keys are namespaced so a same-numbered movie/TV pair can't collide.
+  const negK = type === "tv" ? `hi:tv:${tmdbId}` : `hi:${tmdbId}`;
   if (await negGet(negK)) return null;
   const signal = composeSignal(opts?.signal);
   return pacedCall(async () => {
@@ -301,7 +328,7 @@ export const movieboxHindi: ProviderFn = async (tmdbId, type, _s, _e, opts) => {
     if (!title) return null;
     let hit: SearchHit | null = null;
     try {
-      hit = await findHindiSubject(title, year, signal);
+      hit = await findHindiSubject(title, year, signal, type === "tv" ? "2" : "1");
     } catch (e) {
       if (e instanceof ProviderFailure && e.status === 404) {
         await negSet(negK);
@@ -313,18 +340,20 @@ export const movieboxHindi: ProviderFn = async (tmdbId, type, _s, _e, opts) => {
       await negSet(negK); // no Hindi subject — don't re-search for 24h
       return null;
     }
-    if (await negGet(`stream:${hit.id}`)) return null;
-    const r = await getStream(hit.id, signal);
+    const streamNegK = type === "tv" ? `stream:tv:${hit.id}:${season}:${episode}` : `stream:${hit.id}`;
+    if (await negGet(streamNegK)) return null;
+    const r = await getStream(hit.id, type, season, episode, signal);
     return r ? { ...r, provider: "moviebox-hi" } : null;
   }, opts?.signal);
 };
 
-/** L2 English lane's sequential tier (default resource — original audio). */
-export const moviebox: ProviderFn = async (tmdbId, type, _s, _e, opts) => {
+/** L2 English lane's MovieBox tier — default resource, movies + TV series (Ali 2026-10-10). */
+export const moviebox: ProviderFn = async (tmdbId, type, s, e, opts) => {
   if (!enabled()) return null;
-  if (type !== "movie") return null;
   if (!(await wrapperAlive())) return null;
-  const negK = `en:${tmdbId}`;
+  const season = s ?? 1;
+  const episode = e ?? 1;
+  const negK = type === "tv" ? `en:tv:${tmdbId}` : `en:${tmdbId}`;
   if (await negGet(negK)) return null;
   const signal = composeSignal(opts?.signal);
   return pacedCall(async () => {
@@ -332,7 +361,7 @@ export const moviebox: ProviderFn = async (tmdbId, type, _s, _e, opts) => {
     if (!title) return null;
     let hit: SearchHit | null = null;
     try {
-      hit = await findDefaultSubject(title, year, signal);
+      hit = await findDefaultSubject(title, year, signal, type === "tv" ? "2" : "1");
     } catch (e) {
       if (e instanceof ProviderFailure && e.status === 404) {
         await negSet(negK);
@@ -344,7 +373,8 @@ export const moviebox: ProviderFn = async (tmdbId, type, _s, _e, opts) => {
       await negSet(negK);
       return null;
     }
-    if (await negGet(`stream:${hit.id}`)) return null;
-    return getStream(hit.id, signal);
+    const streamNegK = type === "tv" ? `stream:tv:${hit.id}:${season}:${episode}` : `stream:${hit.id}`;
+    if (await negGet(streamNegK)) return null;
+    return getStream(hit.id, type, season, episode, signal);
   }, opts?.signal);
 };
