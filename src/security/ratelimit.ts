@@ -143,18 +143,33 @@ function windowRetryAfterSec(): number {
   return Math.max(1, 60 - (nowS % 60));
 }
 
-export async function checkRateLimit(pathname: string, identity: string): Promise<RateLimit> {
+export async function checkRateLimit(
+  pathname: string,
+  identity: string,
+  /**
+   * P4 (2026-10-10): false = skip the global backstop INCR. The backstop is
+   * a cluster-wide circuit breaker for AUTHENTICATED traffic floods (leaked
+   * key / botnet). Unauthenticated auth routes (/v1/auth/register,
+   * /v1/auth/refresh) must not feed it: the INCR ran before the per-IP
+   * decision, so one IP spamming /auth/register could trip the backstop
+   * for the whole cluster — an unauthenticated DoS amplifier. Those routes
+   * keep their own 10/min/IP auth-class limit.
+   */
+  countBackstop = true
+): Promise<RateLimit> {
   // P1-7: global backstop FIRST — a leaked shared key spreads across
   // identities, so per-identity buckets alone can't see the aggregate.
-  const backstop = await checkGlobalBackstop();
-  if (backstop.tripped) {
-    return {
-      allowed: false,
-      retryAfterSec: windowRetryAfterSec(),
-      limit: BACKSTOP_LIMIT_PER_MIN,
-      remaining: 0,
-      resetSec: windowRetryAfterSec(),
-    };
+  if (countBackstop) {
+    const backstop = await checkGlobalBackstop();
+    if (backstop.tripped) {
+      return {
+        allowed: false,
+        retryAfterSec: windowRetryAfterSec(),
+        limit: BACKSTOP_LIMIT_PER_MIN,
+        remaining: 0,
+        resetSec: windowRetryAfterSec(),
+      };
+    }
   }
   let capacity: number;
   let cls: string;

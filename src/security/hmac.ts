@@ -22,6 +22,7 @@
 import { sha256Hex, hmacSha256Hex, hmacSha256Verify } from "./crypto.js";
 import { verifyToken } from "./jwt.js";
 import { isRevokedRaw } from "./devices.js";
+import { redisEnabled, redisCommand, redisCircuitState } from "./redis.js";
 
 export const TIMESTAMP_WINDOW_MS = 300_000; // 300s (H4: 60s too tight for clock skew)
 
@@ -124,6 +125,23 @@ export async function verifyHmacParts(
   const valid = await hmacSha256Verify(deviceSecret, canonical, signature);
   if (!valid) {
     return { ok: false, code: "BAD_SIGNATURE", error: "signature mismatch" };
+  }
+
+  // P4 (2026-10-10): replay protection. The 300s timestamp window alone does
+  // NOT stop replays — the exact signed bytes could be re-sent within the
+  // window (e.g. to mint fresh stream URLs without holding the device
+  // secret). The signature is a unique nonce: SET NX EX 300 — a second
+  // sighting inside the window is a replay.
+  // Fail-open on Redis errors (availability): the 300s window still bounds
+  // replays. `SET NX` returns "OK" on first sighting, nil when the key
+  // exists; nil with a healthy circuit therefore means REPLAYED.
+  if (redisEnabled() && !redisCircuitState().circuitOpen) {
+    const nonceKey = `pf:nonce:${await sha256Hex(signature)}`;
+    const seen = await redisCommand(["SET", nonceKey, "1", "NX", "EX", "300"]).catch(() => null);
+    const st = redisCircuitState();
+    if (seen === null && st.consecFails === 0 && !st.circuitOpen) {
+      return { ok: false, code: "REPLAYED", error: "duplicate signed request" };
+    }
   }
 
   return { ok: true, memberRef: claims.sub, deviceId };

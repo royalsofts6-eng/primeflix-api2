@@ -67,6 +67,28 @@ export function randomHex(bytes = 32): string {
   return toHex(crypto.getRandomValues(new Uint8Array(bytes)).buffer as ArrayBuffer);
 }
 
+/**
+ * Constant-time string comparison for secrets (API keys, admin keys, cron
+ * secrets). No early exit on the first differing byte — a remote timing
+ * probe can't learn the secret byte-by-byte. Returns false on length
+ * mismatch (still scans the full longer input).
+ *
+ * P4 (2026-10-10): the auth chain compared secrets with `===`.
+ */
+export function timingSafeEqualStr(a: string, b: string): boolean {
+  const ab = enc.encode(a ?? "");
+  const bb = enc.encode(b ?? "");
+  const n = Math.max(ab.length, bb.length, 1);
+  let diff = ab.length ^ bb.length;
+  for (let i = 0; i < n; i++) {
+    // Guard the modulo against zero-length inputs (ab[NaN] is undefined).
+    const x = ab.length ? ab[i % ab.length] : 0;
+    const y = bb.length ? bb[i % bb.length] : 0;
+    diff |= x ^ y;
+  }
+  return diff === 0;
+}
+
 const B64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 export function b64urlEncode(bytes: Uint8Array): string {

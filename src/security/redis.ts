@@ -221,8 +221,16 @@ export async function redisDeviceRegister(
 // ── Revocation set (key IDs only — never raw member keys) ───────────────────
 const REVOKED_KEY = "pf:revoked";
 
-export async function redisRevokeRef(memberRef: string): Promise<void> {
-  await redisCommand(["SADD", REVOKED_KEY, memberRef]);
+/**
+ * Add a memberRef to the revocation set.
+ * Returns true when the write is CONFIRMED durable (Upstash acknowledged
+ * the SADD — 1 = newly added, 0 = already present, both durable). False
+ * means the write did NOT land (Redis unreachable) — the caller must not
+ * claim cross-instance propagation.
+ */
+export async function redisRevokeRef(memberRef: string): Promise<boolean> {
+  const r = await redisCommand(["SADD", REVOKED_KEY, memberRef]);
+  return typeof r === "number" || (typeof r === "string" && /^\d+$/.test(r));
 }
 
 export async function redisIsRefRevoked(memberRef: string): Promise<boolean | null> {

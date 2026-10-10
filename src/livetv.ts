@@ -14,7 +14,8 @@
  * it serves cache/CURATED and the cron endpoint is the only refresh trigger.
  */
 
-import { cacheGet, cacheSet } from "./cache.js";
+import { cacheGet, cacheSet, ck } from "./cache.js";
+import { redisCacheGet, redisCacheSet } from "./security/redis.js";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -714,8 +715,18 @@ const PLAYLISTS = {
 };
 
 const CACHE_KEY = "livetv:channels:v1";
-const TTL_MS = 12 * 60 * 60 * 1000; // 12h
 const STALE_MS = 7 * 24 * 60 * 60 * 1000; // 7d stale fallback
+// P4 (2026-10-10): two-tier caching for the refresh result.
+//  - L1 (this instance's memory): 5 min. Short on purpose — Redis (L2) is
+//    the shared 12h store, so a refresh run by the cron on ONE instance is
+//    visible to every other instance within ~5 min instead of never.
+//  - L2 (shared Redis `pf:v3:livetv:channels`): 12h when the refresh was
+//    clean, 1h when it was degraded (playlist fetch failed or channels kept
+//    last-good URLs) — dead state is never cached for 12h anymore.
+const MEM_TTL_MS = 5 * 60 * 1000;
+const REDIS_TTL_OK_MS = 12 * 60 * 60 * 1000;
+const REDIS_TTL_DEGRADED_MS = 60 * 60 * 1000;
+const redisLiveTvKey = () => ck("livetv", "channels");
 
 // ── M3U parsing ─────────────────────────────────────────────────────────────
 
@@ -753,8 +764,9 @@ function parseM3U(text: string): PlaylistEntry[] {
   return entries;
 }
 
-// Normalize names for fuzzy matching: "Star Plus HD" -> "starplus"
-function norm(s: string): string {
+// Normalize names for fuzzy matching: "Star Plus HD" -> "starplus".
+// Exported for unit tests (P4: the includes("") guard depends on this).
+export function norm(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
@@ -865,14 +877,24 @@ function isHlsCandidate(url: string): boolean {
 
 /**
  * Refresh ONE channel: harvest playlist candidates, probe, pick best.
- * Returns null when it produced nothing usable — the caller then keeps the
- * previous known-good state for that channel.
+ *
+ * P4 (2026-10-10):
+ *  - Keeps last-good: when every probe fails, the previous known-good URL
+ *    (+ fallbacks) is kept instead of blanking `url` to "". A failed probe
+ *    run must not hide a working channel; the caller shortens the cache TTL
+ *    (`degraded`) so the next refresh retries soon.
+ *  - The partial-match loop skips empty normalized keys: norm() strips
+ *    non-Latin scripts (Urdu names → ""), and `"x".includes("")` is always
+ *    true — without the guard every playlist entry false-matched.
+ *
+ * Exported for unit tests (P4).
  */
-async function refreshOne(
+export async function refreshOne(
   ch: Channel,
+  prev: Channel | undefined,
   index: Map<string, PlaylistEntry[]>,
   probeLimit: <T>(fn: () => Promise<T>) => Promise<T>
-): Promise<Channel | null> {
+): Promise<{ channel: Channel; degraded: boolean }> {
   const key = norm(ch.name);
   const candidates: { url: string; logo?: string }[] = [];
   const seen = new Set<string>();
@@ -897,8 +919,9 @@ async function refreshOne(
   }
 
   // Also try partial matching (e.g. "starplus" in "starplushd")
-  if (candidates.length === 0) {
+  if (candidates.length === 0 && key) {
     for (const [k, entries] of index) {
+      if (!k) continue; // norm() of a non-Latin name is "" — includes("") is always true
       if (k.includes(key) || key.includes(k)) {
         for (const e of entries) {
           if (candidates.length < 5) addCandidate(e);
@@ -910,12 +933,22 @@ async function refreshOne(
   // Logo: curated first, else first playlist tvg-logo found.
   const harvestedLogo = ch.logo || candidates.find((c) => c.logo)?.logo || "";
 
-  // Keep curated URL as first candidate (it's verified)
-  const all = ch.url ? [{ url: ch.url, logo: ch.logo }, ...candidates] : candidates;
+  // Probe order: previous known-good URL first (stick with what worked),
+  // then the curated URL, then fresh playlist candidates — deduped.
+  const seeds: { url: string; logo?: string }[] = [];
+  const pushSeed = (url: string | undefined, logo?: string) => {
+    if (url && !seeds.some((s) => s.url === url)) seeds.push({ url, logo });
+  };
+  pushSeed(prev?.url, prev?.logo);
+  pushSeed(ch.url, ch.logo);
+  const all = [...seeds, ...candidates];
 
   // YouTube channels: no probing (resolved at play time)
   if (ch.type === "youtube") {
-    return { ...ch, fallbacks: candidates.slice(0, 3).map((c) => c.url), logo: harvestedLogo };
+    return {
+      channel: { ...ch, fallbacks: candidates.slice(0, 3).map((c) => c.url), logo: harvestedLogo },
+      degraded: false,
+    };
   }
 
   // Probe with bounded concurrency
@@ -924,12 +957,60 @@ async function refreshOne(
   );
   const alive = all.filter((_, i) => probes[i]);
 
+  if (alive.length === 0) {
+    // Every probe failed — keep the last-known-good state, don't blank it.
+    return {
+      channel: {
+        ...ch,
+        url: prev?.url || ch.url || "",
+        fallbacks: prev?.fallbacks?.length ? prev.fallbacks : ch.fallbacks,
+        logo: prev?.logo || harvestedLogo,
+      },
+      degraded: true,
+    };
+  }
+
   return {
-    ...ch,
-    url: alive[0]?.url || "",
-    fallbacks: alive.slice(1, 4).map((a) => a.url),
-    logo: harvestedLogo,
+    channel: {
+      ...ch,
+      url: alive[0].url,
+      fallbacks: alive.slice(1, 4).map((a) => a.url),
+      logo: harvestedLogo,
+    },
+    degraded: false,
   };
+}
+
+/**
+ * Read the previous refresh result: shared Redis first (written by whichever
+ * instance ran the cron), then this instance's memory. P4 (2026-10-10): the
+ * old code read only per-instance memory, so a refresh on instance A was
+ * invisible to instance B — and B's anti-downgrade baseline was its own
+ * stale memory.
+ */
+async function readPrevRefresh(): Promise<RefreshResult | null> {
+  try {
+    const shared = await redisCacheGet<RefreshResult>(redisLiveTvKey());
+    if (shared && Array.isArray(shared.channels)) return shared;
+  } catch {
+    /* fall through to memory */
+  }
+  return cacheGet<RefreshResult>(CACHE_KEY)?.value ?? null;
+}
+
+/**
+ * Write the refresh result to both tiers: shared Redis (12h when clean, 1h
+ * when degraded — dead state is never cached 12h) + this instance's memory
+ * (5 min L1 so other instances' fresh refreshes become visible quickly).
+ */
+async function writeRefresh(result: RefreshResult, degraded: boolean): Promise<void> {
+  const redisTtlSec = Math.floor((degraded ? REDIS_TTL_DEGRADED_MS : REDIS_TTL_OK_MS) / 1000);
+  try {
+    await redisCacheSet(redisLiveTvKey(), result, redisTtlSec);
+  } catch {
+    /* memory below still updated — never fail the refresh on a cache write */
+  }
+  cacheSet(CACHE_KEY, result, MEM_TTL_MS, STALE_MS);
 }
 
 /**
@@ -946,6 +1027,9 @@ export async function refreshChannels(): Promise<RefreshResult> {
     fetchText(PLAYLISTS.pk, 10000),
     fetchText(PLAYLISTS.in, 10000),
   ]);
+  // A failed playlist fetch degrades this refresh (fewer candidates) — the
+  // result gets the short cache TTL so the next run retries soon.
+  let degraded = !pkText || !inText;
 
   // 2. Build name -> entries index
   const index = new Map<string, PlaylistEntry[]>();
@@ -963,7 +1047,7 @@ export async function refreshChannels(): Promise<RefreshResult> {
   // state (or curated); each batch races the REMAINING budget, so the whole
   // refresh can never overrun maxDuration. Batches that don't finish in time
   // simply keep their baseline — partial results are always written.
-  const prev = cacheGet<RefreshResult>(CACHE_KEY)?.value;
+  const prev = await readPrevRefresh();
   const prevById = new Map((prev?.channels || []).map((c) => [c.id, c]));
   const probeLimit = pLimit(PROBE_CONCURRENCY);
   const channels: Channel[] = CURATED.map((ch) => prevById.get(ch.id) || ch);
@@ -973,12 +1057,16 @@ export async function refreshChannels(): Promise<RefreshResult> {
     if (remaining <= 0) break;
     const batch = CURATED.slice(i, i + CHANNEL_BATCH);
     const done = await Promise.race([
-      Promise.all(batch.map((ch) => refreshOne(ch, index, probeLimit))),
+      Promise.all(batch.map((ch) => refreshOne(ch, prevById.get(ch.id), index, probeLimit))),
       new Promise<null>((res) => setTimeout(() => res(null), remaining)),
     ]);
-    if (done === null) break; // budget exhausted mid-batch — baseline kept
-    done.forEach((ch, j) => {
-      if (ch) channels[i + j] = ch;
+    if (done === null) {
+      degraded = true; // budget exhausted mid-batch — some channels unprobed
+      break;
+    }
+    done.forEach((r, j) => {
+      channels[i + j] = r.channel;
+      if (r.degraded) degraded = true;
     });
   }
 
@@ -1010,7 +1098,7 @@ export async function refreshChannels(): Promise<RefreshResult> {
     result.alive = result.channels.filter(isPlayable).length;
   }
 
-  cacheSet(CACHE_KEY, result, TTL_MS, STALE_MS);
+  await writeRefresh(result, degraded);
   return result;
 }
 
@@ -1035,15 +1123,29 @@ export function pendingChannels(channels: Channel[]): Channel[] {
 }
 
 /**
- * Get channels — serves cache (fast). On cold start seeds from CURATED.
+ * Get channels — serves cache (fast). Two-tier: this instance's memory
+ * (5-min L1), then shared Redis (written by whichever instance ran the
+ * cron), then the curated seed on cold start. Stale memory is still served
+ * when Redis is unreachable (better than curated during an outage).
+ *
  * There is deliberately NO background refresh here: fire-and-forget promises
  * cannot complete on serverless. /v1/cron/livetv-refresh is the only trigger.
  * The full channel list (including unavailable ones) is always returned —
  * the route splits playable vs `pending` honestly.
  */
 export async function getChannels(): Promise<RefreshResult> {
-  const cached = cacheGet<RefreshResult>(CACHE_KEY);
-  if (cached) return cached.value;
+  const mem = cacheGet<RefreshResult>(CACHE_KEY);
+  if (mem && !mem.stale) return mem.value;
+  try {
+    const shared = await redisCacheGet<RefreshResult>(redisLiveTvKey());
+    if (shared && Array.isArray(shared.channels) && shared.channels.length > 0) {
+      cacheSet(CACHE_KEY, shared, MEM_TTL_MS, STALE_MS);
+      return shared;
+    }
+  } catch {
+    /* fall through — stale memory below beats curated during an outage */
+  }
+  if (mem) return mem.value;
   // Cold start: serve curated list immediately (fast), seed the cache.
   const result: RefreshResult = {
     refreshedAt: Date.now(),
@@ -1051,7 +1153,7 @@ export async function getChannels(): Promise<RefreshResult> {
     alive: hideDead(CURATED).length,
     channels: CURATED,
   };
-  cacheSet(CACHE_KEY, result, TTL_MS, STALE_MS);
+  cacheSet(CACHE_KEY, result, MEM_TTL_MS, STALE_MS);
   return result;
 }
 

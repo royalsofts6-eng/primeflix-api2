@@ -39,14 +39,17 @@ import {
   registerPlain,
   refreshPlain,
   revokePlain,
+  deviceRemovePlain,
   apiKeyKilled,
   adminKeyConfigured,
+  type GateResult,
 } from "../src/security/plain.js";
+import { timingSafeEqualStr } from "../src/security/crypto.js";
 import { globalBackstopState } from "../src/security/ratelimit.js";
 import { tmdbCoolingDown } from "../src/tmdb.js";
 import { backgroundWired } from "../src/revalidate.js";
 
-const VERSION = "1.4.0";
+const VERSION = "1.4.1";
 const CLUSTER = process.env.CLUSTER_NAME || "api1";
 const PUBLIC_PATHS = new Set(["/", "/health", "/api", "/api/health"]);
 
@@ -148,6 +151,15 @@ const checkAudio = (res: any, v: string | null): string | undefined | null => {
 const tmdbId = (v: string | undefined): string | null =>
   v && /^\d+$/.test(v) ? v : null;
 
+/**
+ * CRON_SECRET check — header-only, constant-time compare (P4 2026-10-10:
+ * the old `!==` leaked byte-by-byte timing on the secret).
+ */
+const cronSecretOk = (got: string | null): boolean => {
+  const want = process.env.CRON_SECRET || "";
+  return !!want && !!got && timingSafeEqualStr(got, want);
+};
+
 export default async function handler(req: any, res: any) {
   try {
     const url = new URL(req.url || "/", "http://localhost");
@@ -157,13 +169,18 @@ export default async function handler(req: any, res: any) {
 
     // ── Auth ──
     // Public paths skip. /v1/auth/* and /v1/cron/* handle their own auth.
+    // /v1/auth/device/remove is NOT an isAuthRoute: it needs the main gate
+    // (HMAC binding) — its handler supports the memberKey fallback itself.
     const header = nodeHeaderGetter(req);
     const clientIp =
       (header("x-forwarded-for") || "").split(",")[0].trim() ||
       header("x-real-ip") ||
       "unknown";
-    const isAuthRoute = path.startsWith("/v1/auth/");
+    const isAuthRoute = path.startsWith("/v1/auth/") && path !== "/v1/auth/device/remove";
     const isCronRoute = path.startsWith("/v1/cron/");
+    // Hoisted so later routes (e.g. /v1/auth/device/remove) can use the
+    // gate's authenticated identity (mode/memberRef/deviceId).
+    let gate: GateResult | null = null;
     if (!PUBLIC_PATHS.has(url.pathname) && !PUBLIC_PATHS.has(path) && !isAuthRoute && !isCronRoute) {
       // Read body for HMAC signature verification on non-GET requests.
       let gateBody = "";
@@ -179,7 +196,7 @@ export default async function handler(req: any, res: any) {
       req.__gateBody = gateBody;
       // Auth is header-only: X-API-Key (day-1) or HMAC headers. The old
       // ?api_key= query fallback is gone — secrets in URLs land in logs.
-      const gate = await authGatePlain(req.method || "GET", path, (n) => {
+      gate = await authGatePlain(req.method || "GET", path, (n) => {
         if (n === "X-API-Key") return header("X-API-Key");
         return header(n);
       }, clientIp, gateBody, url.search.slice(1));
@@ -218,6 +235,15 @@ export default async function handler(req: any, res: any) {
       const r = await revokePlain(body, header);
       return send(res, r.status, r.json);
     }
+    // P4 (2026-10-10): free one device slot (reinstall flow). Runs through
+    // the main gate above (HMAC-bound memberRef) or the memberKey fallback
+    // inside deviceRemovePlain (lost-device case). Reuses the gate's
+    // already-read body like /v1/stream/report does.
+    if (path === "/v1/auth/device/remove" && req.method === "POST") {
+      const raw = typeof req.__gateBody === "string" ? req.__gateBody : "";
+      const r = await deviceRemovePlain(raw, clientIp, gate?.memberRef ?? null, gate?.mode ?? null);
+      return send(res, r.status, r.json);
+    }
 
     // ── Routes ──
     if (path === "/") {
@@ -244,6 +270,7 @@ export default async function handler(req: any, res: any) {
           "POST /v1/auth/register",
           "POST /v1/auth/refresh",
           "POST /v1/auth/revoke",
+          "POST /v1/auth/device/remove",
           "GET /v1/niazi/series",
           "GET /v1/niazi/series/:id/seasons",
           "GET /v1/niazi/series/:id/episodes",
@@ -583,18 +610,22 @@ export default async function handler(req: any, res: any) {
         // in-app — say so honestly instead of "awaiting-source".
         reason: c.type === "youtube" ? "youtube-only" : "awaiting-source",
       }));
+      // P4 (2026-10-10): failure-aware browser cache — a channel list with
+      // dead/pending channels is re-fetched in 1h, not 12h, so recoveries
+      // reach the app quickly.
+      const browserTtlMs = pending.length > 0 ? 3600 * 1000 : 12 * 3600 * 1000;
       return sendCatalog(res, req, ok({
         refreshedAt: data.refreshedAt,
         total: data.total,
         alive: playable.length,
         groups: groupByCategory(playable),
         pending,
-      }), privateCache(12 * 3600 * 1000));
+      }), privateCache(browserTtlMs));
     }
     if (path === "/v1/cron/livetv-refresh") {
       // CRON_SECRET is header-only — never in the query string (logged).
       const secret = header("x-cron-secret");
-      if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+      if (!cronSecretOk(secret)) {
         return send(res, 401, fail("unauthorized", "BAD_CRON_SECRET"));
       }
       const data = await refreshChannels();
@@ -606,7 +637,7 @@ export default async function handler(req: any, res: any) {
     // Usage: GET /v1/cron/fz-warm?tmdbId=299536  (x-cron-secret header)
     if (path === "/v1/cron/fz-warm") {
       const secret = header("x-cron-secret");
-      if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+      if (!cronSecretOk(secret)) {
         return send(res, 401, fail("unauthorized", "BAD_CRON_SECRET"));
       }
       const id = tmdbId(q.get("tmdbId") || undefined);
@@ -623,7 +654,7 @@ export default async function handler(req: any, res: any) {
     // Usage: GET /v1/cron/stream-warm?limit=40  (x-cron-secret header)
     if (path === "/v1/cron/stream-warm") {
       const secret = header("x-cron-secret");
-      if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+      if (!cronSecretOk(secret)) {
         return send(res, 401, fail("unauthorized", "BAD_CRON_SECRET"));
       }
       const rawLimit = parseInt(q.get("limit") || "40", 10);
@@ -641,7 +672,7 @@ export default async function handler(req: any, res: any) {
     // Usage: GET /v1/cron/fz-warm-batch?limit=30  (x-cron-secret header)
     if (path === "/v1/cron/fz-warm-batch") {
       const secret = header("x-cron-secret");
-      if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+      if (!cronSecretOk(secret)) {
         return send(res, 401, fail("unauthorized", "BAD_CRON_SECRET"));
       }
       const rawLimit = parseInt(q.get("limit") || "16", 10);
