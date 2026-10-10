@@ -1,10 +1,10 @@
 /**
- * Stream resolution cache (P1 — 2026-10-09, envelope v2 2026-10-09): Redis-shared,
+ * Stream resolution cache (P1 — 2026-10-09, envelope v3 2026-10-10): Redis-shared,
  * stale-while-revalidate, request coalescing.
  *
  * Every successful resolveStream() result is cached under
  *   pf:v3:stream:{type}:{tmdbId}:{season}:{episode}:{audio}
- * as envelope v2: { v: 2, result, alternates[<=3], freshUntil, staleUntil }
+ * as envelope v3: { v: 3, result, alternates[<=3], freshUntil, staleUntil }
  * (1 key, 1 read — the app fails over client-side across alternates with
  * zero new backend round-trip).
  *
@@ -89,7 +89,7 @@ export interface StreamArgs {
 }
 
 interface StreamCacheEnvelope {
-  v: 2;
+  v: 3;
   /** Winner (alternates stripped — they live in `alternates`). */
   result: ChainResult;
   /** Ranked runner-ups, best-first (max 3) — client-side failover. */
@@ -200,11 +200,11 @@ const redisKeyFor = (key: string): string => ck("stream", key);
 
 async function readEnvelope(key: string, rkey: string): Promise<StreamCacheEnvelope | null> {
   // Redis first (shared api1+api2 — one warm benefits both clusters),
-  // then per-instance memory. v1 envelopes are ignored (graceful: they
-  // simply re-resolve and are rewritten as v2 — no migration needed).
+  // then per-instance memory. v1/v2 envelopes are ignored (graceful: they
+  // simply re-resolve and are rewritten as v3 — no migration needed).
   if (redisEnabled()) {
     const rhit = await redisCacheGet<StreamCacheEnvelope>(rkey);
-    if (rhit && rhit.v === 2 && rhit.result?.qualities?.length) {
+    if (rhit && rhit.v === 3 && rhit.result?.qualities?.length) {
       // Backfill local memory with the remaining lifetime.
       const now = Date.now();
       const freshMs = Math.max(0, rhit.freshUntil - now);
@@ -215,7 +215,7 @@ async function readEnvelope(key: string, rkey: string): Promise<StreamCacheEnvel
     }
   }
   const hit = cacheGet<StreamCacheEnvelope>(key);
-  if (hit && hit.value.v === 2 && hit.value.result?.qualities?.length) return hit.value;
+  if (hit && hit.value.v === 3 && hit.value.result?.qualities?.length) return hit.value;
   return null;
 }
 
@@ -244,7 +244,7 @@ async function writeEnvelope(key: string, rkey: string, result: ChainResult): Pr
   const now = Date.now();
   const { alternates, ...rest } = result;
   const env: StreamCacheEnvelope = {
-    v: 2,
+    v: 3,
     result: { ...rest, alternates: [] },
     alternates: (alternates ?? []).slice(0, 3),
     freshUntil: now + ttlS * 1000,
@@ -315,7 +315,7 @@ async function pollForResult(rkey: string): Promise<ChainResult | null> {
   while (Date.now() - start < COALESCE_POLL_MS) {
     await sleep(COALESCE_POLL_INTERVAL_MS);
     const env = await redisCacheGet<StreamCacheEnvelope>(rkey);
-    if (env && env.v === 2 && env.result?.qualities?.length && Date.now() < env.freshUntil) {
+    if (env && env.v === 3 && env.result?.qualities?.length && Date.now() < env.freshUntil) {
       return { ...env.result, alternates: env.alternates ?? [] };
     }
   }

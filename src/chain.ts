@@ -559,7 +559,7 @@ export async function tryProvider(
 export interface ChainResult extends ProviderResult {
   resolvedBy: string;
   latencyMs: number;
-  /** Runner-up results for client-side failover (envelope v2). */
+  /** Runner-up results for client-side failover (envelope v3). */
   alternates: RankedAlternate[];
 }
 
@@ -822,7 +822,7 @@ export async function resolveStreamLive(
 /**
  * Cached stream resolution — the entry point every caller uses.
  * Successful resolutions are served from the Redis-shared stream cache
- * (envelope v2: winner + alternates, provider-specific TTLs,
+ * (envelope v3: winner + alternates, provider-specific TTLs,
  * stale-while-revalidate) and concurrent in-flight resolutions for the same
  * title collapse into one upstream resolve. Only successes are cached —
  * errors always go live.
