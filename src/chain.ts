@@ -646,9 +646,8 @@ export async function evictLangVerdict(
     if (redisEnabled()) {
       await redisCommand(["DEL", langK]).catch(() => null);
       // MovieBox-Hindi verdict: drop it too — the chain just proved Hindi
-      // is gone (P0-5 will namespace this key per season; the call is
-      // updated there).
-      await redisCommand(["DEL", mbhilangKey(tmdbId, type)]).catch(() => null);
+      // is gone (P0-5: per-season key).
+      await redisCommand(["DEL", mbhilangKey(tmdbId, type, season ?? 0)]).catch(() => null);
     }
   } catch {
     /* best-effort */
@@ -821,7 +820,8 @@ export async function resolveStreamLive(
     if (
       r.provider === "moviebox-hi" || alternates.some((a) => a.provider === "moviebox-hi")
     ) {
-      void noteMovieboxHindi(tmdbId, true, type);
+      // P0-5: verdict is per-season — an S1 win never claims S2.
+      void noteMovieboxHindi(tmdbId, true, type, season ?? 0);
     }
     return {
       ...r,
@@ -1094,24 +1094,25 @@ async function movieboxHindiAvailable(
     if (!(await movieboxLive())) return false;
     if (await providerBlocked("moviebox-hi")) return false;
     // 1. Shared verdict cache (written by chain wins and past probes).
-    const verdict = await movieboxHindiVerdict(tmdbId, type);
+    // P0-5: per-season — an S1E1 verdict never answers for S2.
+    const verdict = await movieboxHindiVerdict(tmdbId, type, season ?? 0);
     if (verdict !== null) return verdict;
     // 2. 24h negative cache written by chain runs (catalog gaps).
     if (await movieboxHindiKnownMissing(tmdbId, type)) {
-      await noteMovieboxHindi(tmdbId, false, type);
+      await noteMovieboxHindi(tmdbId, false, type, season ?? 0);
       return false;
     }
     // 3. Chain state: any cached envelope (default/Hindi audio keys) whose
     //    winner or alternates include moviebox-hi proves Hindi played.
     const providers = await cachedStreamProviders(type, tmdbId, season, episode);
     if (providers.has("moviebox-hi")) {
-      await noteMovieboxHindi(tmdbId, true, type);
+      await noteMovieboxHindi(tmdbId, true, type, season ?? 0);
       return true;
     }
     // 4. Last resort: ONE paced live probe; the verdict is cached 24h.
     const r = await movieboxHindi(tmdbId, type, season, episode);
     const found = !!(r && r.qualities.length > 0);
-    await noteMovieboxHindi(tmdbId, found, type);
+    await noteMovieboxHindi(tmdbId, found, type, season ?? 0);
     return found;
   } catch {
     return false;

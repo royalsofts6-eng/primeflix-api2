@@ -73,29 +73,35 @@ const negKey = (k: string) => ck("mbneg", k);
 // "0" when a probe proves it doesn't. Cheap Redis read, shared api1+api2.
 // The 12h pf:v3:lang envelope stays the primary throttle — this key only guards
 // the probe path underneath it.
-// Phase D (2026-10-09): versioned key pf:v3:mbhilang:{type}:{id}. Exported so
-// the report route evicts the identical key. Ali 2026-10-10: TV verdicts
-// namespaced per type (movie/tv).
+// Phase D (2026-10-09): versioned key pf:v3:mbhilang:{type}:{id}:{season}.
+// Exported so the report route evicts the identical key. Ali 2026-10-10:
+// TV verdicts namespaced per type (movie/tv); P0-5 (2026-10-10): per
+// season — an S1E1 probe/win must never promise Hindi for S2.
 const MBHILANG_TTL_S = 24 * 3600;
-/** Shared MovieBox-Hindi verdict key (exported for the report route). Never throws. */
-export const mbhilangKey = (tmdbId: string, type: "movie" | "tv" = "movie"): string =>
-  ck("mbhilang", type, tmdbId);
+/**
+ * Shared MovieBox-Hindi verdict key (exported for the report route).
+ * P0-5 (2026-10-10): namespaced per SEASON — a probe/win for S1E1 must
+ * never claim Hindi for S2 (dub availability varies by season). Movies
+ * use season 0. Never throws.
+ */
+export const mbhilangKey = (tmdbId: string, type: "movie" | "tv" = "movie", season = 0): string =>
+  ck("mbhilang", type, tmdbId, season);
 
-/** Record the MovieBox-Hindi verdict for a title. Never throws. */
-export async function noteMovieboxHindi(tmdbId: string, found: boolean, type: "movie" | "tv" = "movie"): Promise<void> {
+/** Record the MovieBox-Hindi verdict for a title+season. Never throws. */
+export async function noteMovieboxHindi(tmdbId: string, found: boolean, type: "movie" | "tv" = "movie", season = 0): Promise<void> {
   if (!redisEnabled()) return;
   try {
-    await redisCacheSet(mbhilangKey(tmdbId, type), found ? "1" : "0", MBHILANG_TTL_S);
+    await redisCacheSet(mbhilangKey(tmdbId, type, season), found ? "1" : "0", MBHILANG_TTL_S);
   } catch {
     /* best-effort */
   }
 }
 
 /** Shared verdict read: true/false, or null when unknown. Never throws. */
-export async function movieboxHindiVerdict(tmdbId: string, type: "movie" | "tv" = "movie"): Promise<boolean | null> {
+export async function movieboxHindiVerdict(tmdbId: string, type: "movie" | "tv" = "movie", season = 0): Promise<boolean | null> {
   if (!redisEnabled()) return null;
   try {
-    const v = await redisCacheGet<string>(mbhilangKey(tmdbId, type));
+    const v = await redisCacheGet<string>(mbhilangKey(tmdbId, type, season));
     return v === "1" ? true : v === "0" ? false : null;
   } catch {
     return null;
