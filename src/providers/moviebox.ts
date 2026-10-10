@@ -133,13 +133,46 @@ export async function movieboxLive(): Promise<boolean> {
 // ── Title matching (D1 verified algorithm + D4 junk filter) ──────────────────
 const norm = (s: string): string => s.toLowerCase().replace(/[^a-z0-9 ]/g, " ");
 
-/** Fraction of the TMDB title's significant tokens present in the candidate. */
-function titleScore(title: string, candidate: string): number {
-  const tokens = norm(title).split(/\s+/).filter((t) => t.length > 2);
-  if (tokens.length === 0) return 0;
-  const ct = norm(candidate);
-  const overlap = tokens.filter((tok) => ct.includes(tok)).length;
-  return overlap / tokens.length;
+/**
+ * Hardened title similarity (P1-7, 2026-10-10). The old 50%-overlap with
+ * SUBSTRING matching let "Dark" match "Dark Matter" and junk uploads win
+ * the matcher.
+ * - Exact token matching (no substrings): "dark" no longer matches
+ *   "darkness"/"dark matter" via containment.
+ * - Extra-token penalty: junk words in the candidate ("Soundtrack", "Best
+ *   Songs ONLY") drag the score down.
+ * - Short titles (<=2 significant tokens): require EVERY title token
+ *   present exactly AND a tight candidate — the wrong-movie engine for
+ *   short titles. Marker words ([Hindi], dubbed, ...) don't count as
+ *   extras.
+ * Exported for unit tests.
+ */
+const MARKER_TOKENS = new Set([
+  "hindi", "dubbed", "esub", "esubs", "subbed", "uncut", "unrated",
+  "extended", "remastered", "proper", "repack",
+]);
+
+export function titleScore(title: string, candidate: string): number {
+  const tTokens = norm(title).split(/\s+/).filter((t) => t.length > 2);
+  if (tTokens.length === 0) return 0;
+  const cTokens = norm(candidate).split(/\s+/).filter((t) => t.length > 2);
+  const cSet = new Set(cTokens);
+  let overlap = 0;
+  for (const tok of tTokens) if (cSet.has(tok)) overlap++;
+  const recall = overlap / tTokens.length;
+  const extra = cTokens.filter((t) => !tTokens.includes(t) && !MARKER_TOKENS.has(t)).length;
+  if (tTokens.length === 1) {
+    // Single-token titles ("Dark", "Dune", "Mirzapur"): the candidate must
+    // be exactly this title (+ optional markers) — anything else is a
+    // different title ("Dark Matter").
+    return recall === 1 && extra === 0 ? 1 : 0;
+  }
+  if (tTokens.length === 2) {
+    // Two-token titles: full exact recall, at most one non-marker extra.
+    if (recall < 1 || extra > 1) return 0;
+  }
+  // Longer titles: recall minus a capped junk-token penalty.
+  return Math.max(0, recall - Math.min(0.45, extra * 0.09));
 }
 
 const subjectYear = (it: any): number =>
@@ -188,11 +221,11 @@ function kindMatches(it: any, type: "movie" | "tv"): boolean {
  *   ["Malayalam","Telugu"]).
  * - Languages array: entries may be "Hindi", "hi", "Hindi; English", etc.
  */
-function hindiMarkedTitle(t: string): boolean {
+export function hindiMarkedTitle(t: string): boolean {
   return /\[hindi\]|\(hindi\)/i.test(t);
 }
 
-function hindiMarkedLangs(langs: string[]): boolean {
+export function hindiMarkedLangs(langs: string[]): boolean {
   return langs.some((l) =>
     String(l)
       .toLowerCase()
