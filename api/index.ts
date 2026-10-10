@@ -423,7 +423,7 @@ export default async function handler(req: any, res: any) {
       const audio = checkAudio(res, q.get("audio"));
       if (audio === null) return;
       const stat: StreamCacheStat = {};
-      const data = await resolveStream(id, "movie", undefined, undefined, audio, stat);
+      const data = await resolveStream(id, "movie", undefined, undefined, audio, stat, "play");
       // Phase D: every successful Play feeds the watch-history ZSET — the
       // pre-warm cron warms THESE titles first (not generic trending).
       noteWatch("movie", id);
@@ -440,7 +440,7 @@ export default async function handler(req: any, res: any) {
       const audio = checkAudio(res, q.get("audio"));
       if (audio === null) return;
       const stat: StreamCacheStat = {};
-      const data = await resolveStream(id, "tv", season, episode, audio, stat);
+      const data = await resolveStream(id, "tv", season, episode, audio, stat, "play");
       // Phase D: every successful Play feeds the watch-history ZSET.
       noteWatch("tv", id);
       return send(res, 200, ok(data), streamCacheHeaders(stat));

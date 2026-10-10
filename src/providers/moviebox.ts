@@ -20,7 +20,7 @@
  * burst 4) + a human gap (800–2500ms) before get_stream. 404 "no streaming
  * link" is a catalog gap — negative-cached 24h, never a circuit failure.
  */
-import type { ProviderFn, ProviderResult, StreamQuality } from "./types.js";
+import type { ProviderFn, ProviderResult, StreamQuality, ProviderCallOpts } from "./types.js";
 import { fetchUpstream, ProviderFailure } from "./failures.js";
 import { tmdb } from "../tmdb.js";
 import { redisEnabled, redisCacheGet, redisCacheSet, redisCommand } from "../security/redis.js";
@@ -421,10 +421,12 @@ async function resolveTitle(tmdbId: string, type: "movie" | "tv"): Promise<{ tit
  * wait AND the human pause both abort early on it (AbortError), so a
  * congested wrapper tier can never stretch a request past the deadline.
  */
-async function pacedCall<T>(work: () => Promise<T>, signal?: AbortSignal): Promise<T> {
-  const release = await acquirePace("mb_wrapper", signal);
+async function pacedCall<T>(work: () => Promise<T>, opts?: ProviderCallOpts): Promise<T> {
+  // P1-12: thread the pacer priority — background probes/prefetches queue
+  // behind real Play requests in the wrapper mutex.
+  const release = await acquirePace("mb_wrapper", opts?.signal, opts?.priority ?? "play");
   try {
-    await humanPause(signal); // 800–2500ms between sequential wrapper calls
+    await humanPause(opts?.signal); // 800–2500ms between sequential wrapper calls
     return await work();
   } finally {
     release();
@@ -462,7 +464,7 @@ export const movieboxHindi: ProviderFn = async (tmdbId, type, s, e, opts) => {
     if (await negGet(streamNegK)) return null;
     const r = await getStream(hit.id, type, season, episode, signal);
     return r ? { ...r, provider: "moviebox-hi" } : null;
-  }, opts?.signal);
+  }, opts);
 };
 
 /** L2 English lane's MovieBox tier — default resource, movies + TV series (Ali 2026-10-10). */
@@ -494,5 +496,5 @@ export const moviebox: ProviderFn = async (tmdbId, type, s, e, opts) => {
     const streamNegK = type === "tv" ? `stream:tv:${hit.id}:${season}:${episode}` : `stream:${hit.id}`;
     if (await negGet(streamNegK)) return null;
     return getStream(hit.id, type, season, episode, signal);
-  }, opts?.signal);
+  }, opts);
 };

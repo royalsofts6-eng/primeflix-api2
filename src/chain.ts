@@ -33,7 +33,7 @@ import { vidzee } from "./providers/vidzee.js";
 import { fzmovies } from "./providers/fzmovies.js";
 import { moviebox, movieboxHindi, movieboxHindiKnownMissing, movieboxHindiVerdict, movieboxLive, noteMovieboxHindi, wrapperStatus, mbhilangKey } from "./providers/moviebox.js";
 import { tmdb } from "./tmdb.js";
-import type { ProviderFn, ProviderResult } from "./providers/types.js";
+import type { ProviderFn, ProviderResult, ProviderCallOpts } from "./providers/types.js";
 import { NotAvailableError } from "./providers/types.js";
 import {
   toProviderFailure,
@@ -463,8 +463,11 @@ export async function tryProvider(
     onError(`http 429${e.retryAfterMs ? ` (retry-after ${e.retryAfterMs}ms)` : ""}`);
     return null;
   };
+  // P1-12: provider call opts (pacer priority) — hoisted: used by both the
+  // first attempt and the retry path.
+  const callOpts: ProviderCallOpts = { signal, priority: raceOpts?.priority };
   try {
-    const r = await p.fn(tmdbId, type, season, episode, { signal });
+    const r = await p.fn(tmdbId, type, season, episode, callOpts);
     if (signal?.aborted) return null;
     if (r && r.qualities.length > 0) {
       if (recordStats()) recordSuccess(p.name, Date.now() - t0);
@@ -535,7 +538,7 @@ export async function tryProvider(
         // (the old code forgot it), and never when the lane settled.
         if (signal?.aborted) return null;
         try {
-          const r2 = await p.fn(tmdbId, type, season, episode, { signal });
+          const r2 = await p.fn(tmdbId, type, season, episode, callOpts);
           if (signal?.aborted) return null;
           if (r2 && r2.qualities.length > 0) {
             if (recordStats()) {
@@ -685,12 +688,16 @@ async function wrapperTier(
   /** P0-2/P1-11: miss reasons out-param — lets the chain distinguish a
    *  genuine catalog gap ("miss: no qualities") from a transient
    *  ("pacer timeout", network, 5xx). */
-  errors?: TierError[]
+  errors?: TierError[],
+  /** P1-12: pacer priority — "play" overtakes "background" in the wrapper
+   *  mutex queue. */
+  priority?: "play" | "background"
 ): Promise<ProviderResult | null> {
   if (signal?.aborted) return null;
   if (await providerBlocked(name)) return null;
   return tryProvider({ name, fn }, tmdbId, type, season, episode, () => true, {
     signal,
+    priority,
     onError: (pname, reason) => errors?.push({ provider: pname, reason }),
   });
 }
@@ -726,7 +733,9 @@ async function movieboxFirst(
    *  45s chain deadline). */
   timeoutMs: number = MOVIEBOX_FIRST_TIMEOUT_MS,
   /** P0-2/P1-11: miss reasons out-param (see wrapperTier). */
-  errors?: TierError[]
+  errors?: TierError[],
+  /** P1-12: pacer priority (see wrapperTier). */
+  priority?: "play" | "background"
 ): Promise<ProviderResult | null> {
   const firstWindow = AbortSignal.timeout(timeoutMs);
   const signal = parentSignal
@@ -734,7 +743,7 @@ async function movieboxFirst(
     : firstWindow;
   // wrapperTier treats abort as a silent miss (never a failure, never a
   // circuit trip) — exactly the "fall through" semantics we want.
-  return wrapperTier(name, fn, tmdbId, type, season, episode, signal, errors);
+  return wrapperTier(name, fn, tmdbId, type, season, episode, signal, errors, priority);
 }
 
 /**
@@ -755,7 +764,10 @@ export async function resolveStreamLive(
   type: "movie" | "tv",
   season?: number,
   episode?: number,
-  audio?: string
+  audio?: string,
+  /** P1-12: pacer priority — real Plays ("play") overtake background
+   *  prefetch/probe/warm legs ("background") in the wrapper mutex queue. */
+  priority: "play" | "background" = "play"
 ): Promise<ChainResult> {
   const t0 = Date.now();
   const alternates: RankedAlternate[] = [];
@@ -784,7 +796,7 @@ export async function resolveStreamLive(
       episode,
       tryProvider,
       providerBlocked,
-      { budgetMs, mode: RACE_MODE, parentSignal: signal }
+      { budgetMs, mode: RACE_MODE, parentSignal: signal, priority }
     );
     laneErrors.push(...tr.errors);
     if (tr.result) {
@@ -877,7 +889,7 @@ export async function resolveStreamLive(
       const MB_TV_TIMEOUT_MS = 15000;
       if (audio === "hi") {
         const mbErrs: TierError[] = [];
-        const mb = await movieboxFirst("moviebox-hi", movieboxHindi, tmdbId, type, season, episode, dsignal, MB_TV_TIMEOUT_MS, mbErrs);
+        const mb = await movieboxFirst("moviebox-hi", movieboxHindi, tmdbId, type, season, episode, dsignal, MB_TV_TIMEOUT_MS, mbErrs, priority);
         if (mb) return win(mb);
         throwIfDeadline();
         // P1-11: a pacer timeout / transient here must NOT become a cached
@@ -885,20 +897,20 @@ export async function resolveStreamLive(
         throw hindiMissError(mbErrs);
       }
       if (audio === "en") {
-        const mb = await movieboxFirst("moviebox", moviebox, tmdbId, type, season, episode, dsignal, MB_TV_TIMEOUT_MS);
+        const mb = await movieboxFirst("moviebox", moviebox, tmdbId, type, season, episode, dsignal, MB_TV_TIMEOUT_MS, undefined, priority);
         if (mb) return win(mb);
         throwIfDeadline();
         throw terminalError();
       }
       // Default: Hindi-first, MovieBox only.
       const mbHiErrs: TierError[] = [];
-      const mbHi = await movieboxFirst("moviebox-hi", movieboxHindi, tmdbId, type, season, episode, dsignal, MB_TV_TIMEOUT_MS, mbHiErrs);
+      const mbHi = await movieboxFirst("moviebox-hi", movieboxHindi, tmdbId, type, season, episode, dsignal, MB_TV_TIMEOUT_MS, mbHiErrs, priority);
       if (mbHi) return win(mbHi);
       throwIfDeadline();
       // P0-2: genuine Hindi content-miss (not transient)? Only a genuine
       // miss invalidates the /languages Hindi verdict on an English win.
       const hindiGenuineMiss = allContentMiss(mbHiErrs);
-      const mbEn = await movieboxFirst("moviebox", moviebox, tmdbId, type, season, episode, dsignal, MB_TV_TIMEOUT_MS);
+      const mbEn = await movieboxFirst("moviebox", moviebox, tmdbId, type, season, episode, dsignal, MB_TV_TIMEOUT_MS, undefined, priority);
       if (mbEn) return win(mbEn, { hindiGenuineMiss });
       throwIfDeadline();
       throw terminalError();
@@ -907,7 +919,7 @@ export async function resolveStreamLive(
       // Ali 2026-10-10: MovieBox first — most accurate catalog kills the
       // wrong-movie problem. 8s window, then the Hindi lane races.
       const mbHiErrs: TierError[] = [];
-      const mbFirst = await movieboxFirst("moviebox-hi", movieboxHindi, tmdbId, type, season, episode, dsignal, MOVIEBOX_FIRST_TIMEOUT_MS, mbHiErrs);
+      const mbFirst = await movieboxFirst("moviebox-hi", movieboxHindi, tmdbId, type, season, episode, dsignal, MOVIEBOX_FIRST_TIMEOUT_MS, mbHiErrs, priority);
       if (mbFirst) return win(mbFirst);
       throwIfDeadline();
       const h1 = await runLane(HINDI_LANE, HINDI_LANE_BUDGET_MS, dsignal);
@@ -920,6 +932,7 @@ export async function resolveStreamLive(
       if ((await originalLanguage(tmdbId, type)) === "hi" && !(await providerBlocked("vidlink"))) {
         const vl = await tryProvider({ name: "vidlink", fn: vidlink }, tmdbId, type, season, episode, () => true, {
           signal: dsignal,
+          priority, // P1-12
           onError: (p, r) => vlErrs.push({ provider: p, reason: r }),
         });
         if (vl) return win(vl);
@@ -932,7 +945,7 @@ export async function resolveStreamLive(
 
     if (audio === "en") {
       // Ali 2026-10-10: MovieBox-en first (5s), then the English lane.
-      const mbFirst = await movieboxFirst("moviebox", moviebox, tmdbId, type, season, episode, dsignal);
+      const mbFirst = await movieboxFirst("moviebox", moviebox, tmdbId, type, season, episode, dsignal, undefined, undefined, priority);
       if (mbFirst) return win(mbFirst);
       throwIfDeadline();
       const e1 = await runLane(ENGLISH_LANE, ENGLISH_LANE_BUDGET_MS, dsignal);
@@ -943,7 +956,7 @@ export async function resolveStreamLive(
 
     // Default: Hindi-first — MB-hi (8s) -> L1 -> MB-en (8s) -> L2.
     const mbHiErrs: TierError[] = [];
-    const mbHiFirst = await movieboxFirst("moviebox-hi", movieboxHindi, tmdbId, type, season, episode, dsignal, MOVIEBOX_FIRST_TIMEOUT_MS, mbHiErrs);
+    const mbHiFirst = await movieboxFirst("moviebox-hi", movieboxHindi, tmdbId, type, season, episode, dsignal, MOVIEBOX_FIRST_TIMEOUT_MS, mbHiErrs, priority);
     if (mbHiFirst) return win(mbHiFirst);
     throwIfDeadline();
     const hindiErrMark = laneErrors.length;
@@ -962,7 +975,7 @@ export async function resolveStreamLive(
     // reasons. (Movies only — the TV dispatch above returns before this point.)
     const mbEnCatalogGap = await movieboxHindiKnownMissing(tmdbId);
     if (!mbEnCatalogGap) {
-      const mbEnFirst = await movieboxFirst("moviebox", moviebox, tmdbId, type, season, episode, dsignal);
+      const mbEnFirst = await movieboxFirst("moviebox", moviebox, tmdbId, type, season, episode, dsignal, undefined, undefined, priority);
       if (mbEnFirst) return win(mbEnFirst);
       throwIfDeadline();
     }
@@ -989,11 +1002,13 @@ export async function resolveStream(
   season?: number,
   episode?: number,
   audio?: string,
-  stat?: StreamCacheStat
+  stat?: StreamCacheStat,
+  /** P1-12: pacer priority — "play" for user Plays, "background" for warmers. */
+  priority: "play" | "background" = "play"
 ): Promise<ChainResult> {
   return resolveStreamCached(
     { tmdbId, type, season, episode, audio },
-    () => resolveStreamLive(tmdbId, type, season, episode, audio),
+    () => resolveStreamLive(tmdbId, type, season, episode, audio, priority),
     stat
   );
 }
@@ -1038,7 +1053,9 @@ export function prefetchStreamOnDetail(
           }
           await resolveStreamCached(
             { type, tmdbId, season, episode, audio },
-            () => resolveStreamLive(tmdbId, type, season, episode, audio)
+            // P1-12: prefetch is background work — it queues BEHIND real
+            // Plays in the wrapper mutex, never ahead of them.
+            () => resolveStreamLive(tmdbId, type, season, episode, audio, "background")
           );
         }
       } catch {
@@ -1133,7 +1150,8 @@ async function movieboxHindiAvailable(
       return true;
     }
     // 4. Last resort: ONE paced live probe; the verdict is cached 24h.
-    const r = await movieboxHindi(tmdbId, type, season, episode);
+    // P1-12: background priority — a probe must never starve a real Play.
+    const r = await movieboxHindi(tmdbId, type, season, episode, { priority: "background" });
     const found = !!(r && r.qualities.length > 0);
     await noteMovieboxHindi(tmdbId, found, type, season ?? 0);
     return found;

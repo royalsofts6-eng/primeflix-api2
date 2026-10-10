@@ -170,7 +170,7 @@ export async function warmTrendingStreams(limit: number): Promise<WarmReport> {
           continue;
         }
         cmdBudget -= 8;
-        await resolveStream(t.id, t.type, season, episode, audio);
+        await resolveStream(t.id, t.type, season, episode, audio, undefined, "background");
         warmed++;
         watchedWarmed++;
       } catch {
@@ -231,7 +231,7 @@ export async function warmTrendingStreams(limit: number): Promise<WarmReport> {
             // Default (Hindi-first) chain — writes to the shared stream cache
             // on success via resolveStreamCached.
             cmdBudget -= 8; // a real resolve ≈ ~8 commands
-            await resolveStream(t.id, t.type, season, episode, audio);
+            await resolveStream(t.id, t.type, season, episode, audio, undefined, "background");
             warmed++;
           } catch {
             failed++;

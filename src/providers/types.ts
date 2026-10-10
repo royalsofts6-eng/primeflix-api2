@@ -30,6 +30,12 @@ export interface ProviderResult {
 export interface ProviderCallOpts {
   /** Lane-shared signal — set when the lane settles so losers abort. */
   signal?: AbortSignal;
+  /**
+   * P1-12 (2026-10-10): pacer priority. "play" (real user Play) overtakes
+   * "background" (/languages probes, prefetch, warm cron) in the wrapper
+   * mutex queue — background work must never starve a Play into a timeout.
+   */
+  priority?: "play" | "background";
 }
 
 /** Provider function signature. */
