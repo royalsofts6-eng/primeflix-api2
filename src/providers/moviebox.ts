@@ -181,7 +181,9 @@ function kindMatches(it: any, type: "movie" | "tv"): boolean {
 }
 
 /**
- * D1 mapping: "{title} hindi" -> Hindi-marked subject, year ±1,
+ * D1 mapping: "{title} hindi" -> Hindi-marked subject, year ±1
+ * (±10 for TV with an explicit [Hindi] title marker — dub uploads often
+ * carry the dub-release year, e.g. GoT [Hindi]=2019 vs TMDB 2011),
  * kind movie/series per requested type, ≥50% token overlap (D4 junk
  * filter — drops mislabeled uploads like "Cheetah on Fire").
  * Hindi signal: [Hindi]/(Hindi) title marker OR "hindi" in the wrapper's
@@ -199,10 +201,16 @@ async function findHindiSubject(
   for (const it of items) {
     const t = String(it.title ?? it.name ?? "");
     const langs: string[] = Array.isArray(it.languages) ? it.languages.map((l: any) => String(l)) : [];
-    const hindiMarked = /\[hindi\]|\(hindi\)/i.test(t) || langs.some((l) => l.toLowerCase() === "hindi");
-    if (!hindiMarked) continue; // Hindi signal required
+    const titleMarked = /\[hindi\]|\(hindi\)/i.test(t);
+    const langMarked = langs.some((l) => l.toLowerCase() === "hindi");
+    if (!titleMarked && !langMarked) continue; // Hindi signal required
     const y = subjectYear(it);
-    if (y && year && Math.abs(y - year) > 1) continue; // year ±1
+    // Year gate: Hindi-dub uploads often carry the dub-release year instead of
+    // the original year (GoT [Hindi]=2019 vs TMDB 2011; Breaking Bad [Hindi]=2013
+    // vs TMDB 2008). An explicit [Hindi] title marker is a deliberate dub label,
+    // so for TV it widens the gate to ±10; everything else keeps the ±1 filter.
+    const yearGate = type === "tv" && titleMarked ? 10 : 1;
+    if (y && year && Math.abs(y - year) > yearGate) continue;
     if (!kindMatches(it, type)) continue;
     const score = titleScore(title, t);
     if (score > bestScore && score >= 0.5) {
