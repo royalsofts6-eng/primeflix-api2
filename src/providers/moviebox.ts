@@ -352,6 +352,27 @@ function extractQuality(url: string): string {
   return "720p";
 }
 
+/**
+ * P2-14 (2026-10-10): build the CDN request headers for a MovieBox stream.
+ * Live wrapper probes prove the CDN requires the Edge-Cache-Cookie (403
+ * without it; Referer/Origin NOT required) and the wrapper itself always
+ * sends {Cookie, User-Agent: Mozilla/5.0}. If a response ever arrives
+ * without headers (the reported MP4 case — not reproducible against the
+ * live wrapper, which serves DASH only in ~18 probes), synthesize them
+ * from the cookie: the app must never get headers=[] for MovieBox.
+ * Exported for unit tests.
+ */
+export function buildMovieboxHeaders(
+  cookie: string | undefined,
+  wrapperHeaders: Record<string, string> | undefined
+): Record<string, string> {
+  return {
+    "User-Agent": "Mozilla/5.0", // the wrapper's own proven UA
+    ...(wrapperHeaders ?? {}),
+    ...(cookie ? { Cookie: cookie } : {}),
+  };
+}
+
 async function getStream(
   subjectId: string,
   type: "movie" | "tv",
@@ -390,20 +411,21 @@ async function getStream(
       size: parseInt(d.size ?? "0", 10) || 0,
     },
   ];
+  const cookie = typeof d.cookie === "string" ? d.cookie : undefined;
+  const wrapperHeaders =
+    d.headers && typeof d.headers === "object" && !Array.isArray(d.headers)
+      ? (d.headers as Record<string, string>)
+      : undefined;
   return {
     provider: "moviebox",
     qualities,
     subtitles: [],
     // Edge-Cache-Cookie -> the app sends it as a Cookie header on the
-    // manifest + every segment (without it the CDN 403s — live verified).
-    cookie: typeof d.cookie === "string" ? d.cookie : undefined,
-    // 2026-10-10 (428 fix): wrapper get_stream may also return extra request
-    // headers (e.g. Referer) required by the CDN for MP4 progressive URLs.
-    // Forward them so the app sends them (without them: 428).
-    headers:
-      d.headers && typeof d.headers === "object" && !Array.isArray(d.headers)
-        ? (d.headers as Record<string, string>)
-        : undefined,
+    // manifest + every segment (without it the CDN 403s — live verified
+    // 2026-10-10). buildMovieboxHeaders guarantees headers is never empty:
+    // cookie-derived Cookie + the wrapper's proven User-Agent.
+    cookie,
+    headers: buildMovieboxHeaders(cookie, wrapperHeaders),
   };
 }
 
