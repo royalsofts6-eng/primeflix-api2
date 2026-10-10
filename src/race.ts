@@ -89,6 +89,8 @@ export interface RankedAlternate {
   subtitles?: Subtitle[];
   /** Passthrough (e.g. MovieBox Edge-Cache-Cookie) when present. */
   cookie?: string;
+  /** Passthrough extra CDN request headers (e.g. Referer for MP4, 2026-10-10). */
+  headers?: Record<string, string>;
   latencyMs: number;
 }
 

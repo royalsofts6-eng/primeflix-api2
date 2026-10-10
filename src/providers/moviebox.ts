@@ -306,6 +306,13 @@ async function getStream(
     // Edge-Cache-Cookie -> the app sends it as a Cookie header on the
     // manifest + every segment (without it the CDN 403s — live verified).
     cookie: typeof d.cookie === "string" ? d.cookie : undefined,
+    // 2026-10-10 (428 fix): wrapper get_stream may also return extra request
+    // headers (e.g. Referer) required by the CDN for MP4 progressive URLs.
+    // Forward them so the app sends them (without them: 428).
+    headers:
+      d.headers && typeof d.headers === "object" && !Array.isArray(d.headers)
+        ? (d.headers as Record<string, string>)
+        : undefined,
   };
 }
 

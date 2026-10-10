@@ -682,6 +682,7 @@ export async function resolveStreamLive(
           qualities: s.result.qualities,
           subtitles: s.result.subtitles,
           cookie: s.result.cookie,
+          headers: s.result.headers,
           latencyMs: s.latencyMs,
         });
       }

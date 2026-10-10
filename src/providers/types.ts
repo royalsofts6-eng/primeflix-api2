@@ -20,6 +20,10 @@ export interface ProviderResult {
   /** e.g. MovieBox wrapper Edge-Cache-Cookie — the player sends it as a
    *  Cookie header on manifest + segment requests (without it: 403). */
   cookie?: string;
+  /** Extra HTTP request headers for the CDN (e.g. Referer for MovieBox MP4
+   *  progressive URLs — without it the CDN 428s. 2026-10-10). Forwarded from
+   *  the wrapper's get_stream `headers` field. */
+  headers?: Record<string, string>;
 }
 
 /** Options passed to every provider call (race.ts). */
