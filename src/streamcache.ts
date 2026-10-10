@@ -260,6 +260,24 @@ async function writeEnvelope(key: string, rkey: string, result: ChainResult): Pr
   await negClear(key);
 }
 
+/**
+ * P1-13 (2026-10-10): winning provider of the cached envelope for a title,
+ * or null when there is none. Lets /v1/stream/report attribute dead-URL
+ * reports that carry no provider (the app sends provider:"" for prefetched
+ * streams) so dead prefetch URLs still feed the canary instead of
+ * vanishing. Never throws (fail-open -> null).
+ */
+export async function cachedEnvelopeProvider(args: StreamArgs): Promise<string | null> {
+  try {
+    const key = streamCacheKey(args.type, args.tmdbId, args.season, args.episode, args.audio);
+    const env = await readEnvelope(key, redisKeyFor(key));
+    const p = env?.result?.provider;
+    return typeof p === "string" && /^[a-z0-9-]{1,32}$/.test(p) ? p : null;
+  } catch {
+    return null;
+  }
+}
+
 /** True when a FRESH (non-stale) entry exists — used by the pre-warm cron. */
 export async function isStreamCachedFresh(
   type: "movie" | "tv",
@@ -456,6 +474,17 @@ export async function resolveStreamCached(
   stats.misses++;
   try {
     const r = await resolveLiveSingleflight(key, rkey, live);
+    // P0-2 (2026-10-10): file the envelope under the ACTUALLY-served audio
+    // key too — a default-chain Hindi win IS a valid ?audio=hi answer (same
+    // legs: MB-hi/L1) and a default-chain English win IS a valid ?audio=en
+    // answer (same legs: MB-en/L2), so explicit-audio requests hit the
+    // cache instead of re-running the chain. Non-hi/en codes (e.g. VidLink
+    // serving the "ko" original) have no request-side key — skip.
+    const servedAudioKey = r.audio === "hi" || r.audio === "en" ? r.audio : undefined;
+    if (servedAudioKey && servedAudioKey !== (args.audio || "def")) {
+      const skey = streamCacheKey(args.type, args.tmdbId, args.season, args.episode, servedAudioKey);
+      await writeEnvelope(skey, redisKeyFor(skey), r).catch(() => {});
+    }
     if (stat) {
       stat.status = "MISS";
       stat.provider = r?.provider;

@@ -22,7 +22,7 @@ import { NotAvailableError } from "../src/providers/types.js";
 import { raceStats } from "../src/race.js";
 import { warmFZMovies, fzStats } from "../src/providers/fzmovies.js";
 import { cacheStats, ck, CACHE_SCHEMA } from "../src/cache.js";
-import { streamCacheStats, streamCacheKey } from "../src/streamcache.js";
+import { streamCacheStats, streamCacheKey, cachedEnvelopeProvider } from "../src/streamcache.js";
 import type { StreamCacheStat } from "../src/streamcache.js";
 import { warmTrendingStreams, warmFZMoviesBatch, noteWatch } from "../src/warm.js";
 import { redisCommand } from "../src/security/redis.js";
@@ -61,7 +61,9 @@ function send(res: any, status: number, body: unknown, headers: Record<string, s
 }
 
 const ok = (data: unknown) => ({ success: true, data });
-const fail = (error: string, code: string) => ({ success: false, error, code });
+const fail = (error: string, code: string, extra?: Record<string, unknown>) => ({
+  success: false, error, code, ...extra,
+});
 
 /**
  * Authenticated responses are NEVER edge-cached publicly. Vercel keys edge
@@ -448,7 +450,7 @@ export default async function handler(req: any, res: any) {
       const audio = checkAudio(res, q.get("audio"));
       if (audio === null) return;
       const stat: StreamCacheStat = {};
-      const data = await resolveStream(id, "movie", undefined, undefined, audio, stat);
+      const data = await resolveStream(id, "movie", undefined, undefined, audio, stat, "play");
       // Phase D: every successful Play feeds the watch-history ZSET — the
       // pre-warm cron warms THESE titles first (not generic trending).
       noteWatch("movie", id);
@@ -465,7 +467,7 @@ export default async function handler(req: any, res: any) {
       const audio = checkAudio(res, q.get("audio"));
       if (audio === null) return;
       const stat: StreamCacheStat = {};
-      const data = await resolveStream(id, "tv", season, episode, audio, stat);
+      const data = await resolveStream(id, "tv", season, episode, audio, stat, "play");
       // Phase D: every successful Play feeds the watch-history ZSET.
       noteWatch("tv", id);
       return send(res, 200, ok(data), streamCacheHeaders(stat));
@@ -510,9 +512,15 @@ export default async function handler(req: any, res: any) {
         typeof b.provider === "string" && /^[a-z0-9-]{1,32}$/i.test(b.provider)
           ? b.provider.toLowerCase()
           : null;
+      // P1-13 (2026-10-10): the app sends provider:"" for prefetched streams
+      // (its lastProvider is empty on the prefetch path) — derive the
+      // provider from the cached envelope so dead prefetch URLs still feed
+      // the canary instead of vanishing.
+      const effectiveProvider =
+        providerName ?? (await cachedEnvelopeProvider({ type, tmdbId: id, season, episode, audio }));
       let deadCount = 0;
-      if (providerName) {
-        deadCount = await recordDeadReport(providerName);
+      if (effectiveProvider) {
+        deadCount = await recordDeadReport(effectiveProvider);
       }
       const guard = await redisCommand(["SET", guardKey, "1", "NX", "EX", 3600]).catch(() => null);
       if (guard !== "OK") {
@@ -526,7 +534,7 @@ export default async function handler(req: any, res: any) {
         "LPUSH",
         deadlogKey,
         JSON.stringify({
-          provider: providerName,
+          provider: effectiveProvider,
           type,
           tmdbId: id,
           season: season ?? 0,
@@ -554,8 +562,8 @@ export default async function handler(req: any, res: any) {
       const HINDI_LANE = new Set(["vidzee", "fzmovies", "moviebox-hi"]);
       const hindiGone =
         b.reason === "hindi_no_longer_available" ||
-        (providerName !== null &&
-          HINDI_LANE.has(providerName) &&
+        (effectiveProvider !== null &&
+          HINDI_LANE.has(effectiveProvider) &&
           (audio === undefined || audio === "hi"));
       // Phase D (2026-10-09, design §4a): a 403/404 is signature death
       // (not a network blip) — the lang envelope for this title must be
@@ -569,8 +577,8 @@ export default async function handler(req: any, res: any) {
         cacheDel(langKey);
         // The MovieBox-Hindi verdict may be stale now too (the dub is
         // reported gone) — drop it so the next /languages re-probes
-        // instead of trusting yesterday's "1" for 24h.
-        await redisCommand(["DEL", mbhilangKey(id, type === "tv" ? "tv" : "movie")]).catch(() => null);
+        // instead of trusting yesterday's "1" for 24h. P0-5: per-season key.
+        await redisCommand(["DEL", mbhilangKey(id, type === "tv" ? "tv" : "movie", season ?? 0)]).catch(() => null);
       }
       return send(res, 200, ok({ evicted: true, deadReportsToday: deadCount }));
     }
@@ -687,6 +695,10 @@ export default async function handler(req: any, res: any) {
     let code = "UPSTREAM_ERROR";
     let status = 500;
     let error = msg; // P2-2-style: some errors get a plain-language message
+    // P2-15 (2026-10-10): machine-readable retry hint. 404s (genuinely not
+    // available) are NOT retryable — the app must not fail over to the other
+    // cluster and re-run the chain for a known-dead title. Timeouts are.
+    let retryable: boolean | undefined;
     const headers: Record<string, string> = {};
     if (e instanceof NotAvailableError) {
       // Win #2 (2026-10-09): honest fast-fail — a recent attempt already
@@ -695,6 +707,7 @@ export default async function handler(req: any, res: any) {
       code = "NOT_AVAILABLE";
       status = 404;
       error = "This title is not available on any source right now";
+      retryable = false;
       if ((e as unknown as { negCacheHit?: boolean }).negCacheHit) {
         headers["X-Cache"] = "NEG";
       }
@@ -706,6 +719,7 @@ export default async function handler(req: any, res: any) {
       code = "RESOLVE_TIMEOUT";
       status = 504;
       error = "Stream search timed out — please try again";
+      retryable = true;
     } else if (msg.includes("request body too large")) {
       code = "PAYLOAD_TOO_LARGE";
       status = 413;
@@ -713,8 +727,21 @@ export default async function handler(req: any, res: any) {
       code = "BAD_QUERY";
       status = 400;
     } else if (msg.includes("hindi dubbed not available")) {
+      // P1-10 (2026-10-10): honest not-available, NOT a 502. "Server is busy"
+      // was a lie — no provider has this title in Hindi. 404 + retryable:false
+      // so the app doesn't fail over to the other cluster (P2-15).
       code = "HINDI_UNAVAILABLE";
+      status = 404;
+      error = "Hindi dub is not available for this title";
+      retryable = false;
+    } else if (/transient/i.test(msg)) {
+      // P1-11 (2026-10-10): the chain classified this as a TRANSIENT upstream
+      // failure (pacer congestion, timeout, network, 5xx) — not a content
+      // miss. Honest 502 (upstream failed, not us), retryable.
+      code = "UPSTREAM_ERROR";
       status = 502;
+      error = "Upstream sources are temporarily unreachable — please try again";
+      retryable = true;
     } else if (msg.includes("TMDB rate limited")) {
       code = "TMDB_RATE_LIMIT";
       status = 429;
@@ -734,6 +761,6 @@ export default async function handler(req: any, res: any) {
       code = "UPSTREAM_ERROR";
       status = upstream >= 400 && upstream < 500 ? upstream : 502;
     }
-    return send(res, status, fail(error, code), headers);
+    return send(res, status, fail(error, code, retryable === undefined ? undefined : { retryable }), headers);
   }
 }

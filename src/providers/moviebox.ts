@@ -20,7 +20,7 @@
  * burst 4) + a human gap (800–2500ms) before get_stream. 404 "no streaming
  * link" is a catalog gap — negative-cached 24h, never a circuit failure.
  */
-import type { ProviderFn, ProviderResult, StreamQuality } from "./types.js";
+import type { ProviderFn, ProviderResult, StreamQuality, ProviderCallOpts } from "./types.js";
 import { fetchUpstream, ProviderFailure } from "./failures.js";
 import { tmdb } from "../tmdb.js";
 import { redisEnabled, redisCacheGet, redisCacheSet, redisCommand } from "../security/redis.js";
@@ -73,29 +73,35 @@ const negKey = (k: string) => ck("mbneg", k);
 // "0" when a probe proves it doesn't. Cheap Redis read, shared api1+api2.
 // The 12h pf:v3:lang envelope stays the primary throttle — this key only guards
 // the probe path underneath it.
-// Phase D (2026-10-09): versioned key pf:v3:mbhilang:{type}:{id}. Exported so
-// the report route evicts the identical key. Ali 2026-10-10: TV verdicts
-// namespaced per type (movie/tv).
+// Phase D (2026-10-09): versioned key pf:v3:mbhilang:{type}:{id}:{season}.
+// Exported so the report route evicts the identical key. Ali 2026-10-10:
+// TV verdicts namespaced per type (movie/tv); P0-5 (2026-10-10): per
+// season — an S1E1 probe/win must never promise Hindi for S2.
 const MBHILANG_TTL_S = 24 * 3600;
-/** Shared MovieBox-Hindi verdict key (exported for the report route). Never throws. */
-export const mbhilangKey = (tmdbId: string, type: "movie" | "tv" = "movie"): string =>
-  ck("mbhilang", type, tmdbId);
+/**
+ * Shared MovieBox-Hindi verdict key (exported for the report route).
+ * P0-5 (2026-10-10): namespaced per SEASON — a probe/win for S1E1 must
+ * never claim Hindi for S2 (dub availability varies by season). Movies
+ * use season 0. Never throws.
+ */
+export const mbhilangKey = (tmdbId: string, type: "movie" | "tv" = "movie", season = 0): string =>
+  ck("mbhilang", type, tmdbId, season);
 
-/** Record the MovieBox-Hindi verdict for a title. Never throws. */
-export async function noteMovieboxHindi(tmdbId: string, found: boolean, type: "movie" | "tv" = "movie"): Promise<void> {
+/** Record the MovieBox-Hindi verdict for a title+season. Never throws. */
+export async function noteMovieboxHindi(tmdbId: string, found: boolean, type: "movie" | "tv" = "movie", season = 0): Promise<void> {
   if (!redisEnabled()) return;
   try {
-    await redisCacheSet(mbhilangKey(tmdbId, type), found ? "1" : "0", MBHILANG_TTL_S);
+    await redisCacheSet(mbhilangKey(tmdbId, type, season), found ? "1" : "0", MBHILANG_TTL_S);
   } catch {
     /* best-effort */
   }
 }
 
 /** Shared verdict read: true/false, or null when unknown. Never throws. */
-export async function movieboxHindiVerdict(tmdbId: string, type: "movie" | "tv" = "movie"): Promise<boolean | null> {
+export async function movieboxHindiVerdict(tmdbId: string, type: "movie" | "tv" = "movie", season = 0): Promise<boolean | null> {
   if (!redisEnabled()) return null;
   try {
-    const v = await redisCacheGet<string>(mbhilangKey(tmdbId, type));
+    const v = await redisCacheGet<string>(mbhilangKey(tmdbId, type, season));
     return v === "1" ? true : v === "0" ? false : null;
   } catch {
     return null;
@@ -133,13 +139,46 @@ export async function movieboxLive(): Promise<boolean> {
 // ── Title matching (D1 verified algorithm + D4 junk filter) ──────────────────
 const norm = (s: string): string => s.toLowerCase().replace(/[^a-z0-9 ]/g, " ");
 
-/** Fraction of the TMDB title's significant tokens present in the candidate. */
-function titleScore(title: string, candidate: string): number {
-  const tokens = norm(title).split(/\s+/).filter((t) => t.length > 2);
-  if (tokens.length === 0) return 0;
-  const ct = norm(candidate);
-  const overlap = tokens.filter((tok) => ct.includes(tok)).length;
-  return overlap / tokens.length;
+/**
+ * Hardened title similarity (P1-7, 2026-10-10). The old 50%-overlap with
+ * SUBSTRING matching let "Dark" match "Dark Matter" and junk uploads win
+ * the matcher.
+ * - Exact token matching (no substrings): "dark" no longer matches
+ *   "darkness"/"dark matter" via containment.
+ * - Extra-token penalty: junk words in the candidate ("Soundtrack", "Best
+ *   Songs ONLY") drag the score down.
+ * - Short titles (<=2 significant tokens): require EVERY title token
+ *   present exactly AND a tight candidate — the wrong-movie engine for
+ *   short titles. Marker words ([Hindi], dubbed, ...) don't count as
+ *   extras.
+ * Exported for unit tests.
+ */
+const MARKER_TOKENS = new Set([
+  "hindi", "dubbed", "esub", "esubs", "subbed", "uncut", "unrated",
+  "extended", "remastered", "proper", "repack",
+]);
+
+export function titleScore(title: string, candidate: string): number {
+  const tTokens = norm(title).split(/\s+/).filter((t) => t.length > 2);
+  if (tTokens.length === 0) return 0;
+  const cTokens = norm(candidate).split(/\s+/).filter((t) => t.length > 2);
+  const cSet = new Set(cTokens);
+  let overlap = 0;
+  for (const tok of tTokens) if (cSet.has(tok)) overlap++;
+  const recall = overlap / tTokens.length;
+  const extra = cTokens.filter((t) => !tTokens.includes(t) && !MARKER_TOKENS.has(t)).length;
+  if (tTokens.length === 1) {
+    // Single-token titles ("Dark", "Dune", "Mirzapur"): the candidate must
+    // be exactly this title (+ optional markers) — anything else is a
+    // different title ("Dark Matter").
+    return recall === 1 && extra === 0 ? 1 : 0;
+  }
+  if (tTokens.length === 2) {
+    // Two-token titles: full exact recall, at most one non-marker extra.
+    if (recall < 1 || extra > 1) return 0;
+  }
+  // Longer titles: recall minus a capped junk-token penalty.
+  return Math.max(0, recall - Math.min(0.45, extra * 0.09));
 }
 
 const subjectYear = (it: any): number =>
@@ -181,13 +220,43 @@ function kindMatches(it: any, type: "movie" | "tv"): boolean {
 }
 
 /**
- * D1 mapping: "{title} hindi" -> Hindi-marked subject, year ±1
- * (±10 for TV with an explicit [Hindi] title marker — dub uploads often
- * carry the dub-release year, e.g. GoT [Hindi]=2019 vs TMDB 2011),
- * kind movie/series per requested type, ≥50% token overlap (D4 junk
- * filter — drops mislabeled uploads like "Cheetah on Fire").
- * Hindi signal: [Hindi]/(Hindi) title marker OR "hindi" in the wrapper's
- * languages array (series often lack title markers).
+ * Hindi signals on a wrapper subject (live shapes 2026-10-10).
+ * - Explicit title marker: "Title [Hindi]" / "Title (Hindi)" — the
+ *   reliable signal (the languages array is noise: "Breaking Bad [Hindi]"
+ *   lists ["English","Spanish"], "Premalu [Hindi]" lists
+ *   ["Malayalam","Telugu"]).
+ * - Languages array: entries may be "Hindi", "hi", "Hindi; English", etc.
+ */
+export function hindiMarkedTitle(t: string): boolean {
+  return /\[hindi\]|\(hindi\)/i.test(t);
+}
+
+export function hindiMarkedLangs(langs: string[]): boolean {
+  return langs.some((l) =>
+    String(l)
+      .toLowerCase()
+      .split(/[;,/]/)
+      .some((p) => {
+        const w = p.trim();
+        return w === "hindi" || w === "hi";
+      })
+  );
+}
+
+/**
+ * D1 mapping: "{title} hindi" -> Hindi subject.
+ *
+ * Hindi signal (P0-4, 2026-10-10 — live-verified: the languages array is
+ * noise; "Breaking Bad [Hindi]" lists ["English","Spanish"], "Premalu
+ * [Hindi]" lists ["Malayalam","Telugu"]):
+ * - STRONG: explicit [Hindi]/(Hindi) title marker. Year gate ±1 (movies)
+ *   or ±10 (TV — dub uploads carry the dub-release year, e.g. GoT
+ *   [Hindi]=2019 vs TMDB 2011; P0-3: do not regress). P1-8: a missing
+ *   year no longer skips the gate silently — score x0.7 penalty.
+ * - MEDIUM ("equivalent strong signal"): languages-array Hindi WITHOUT a
+ *   title marker (Hindi originals like 'Mirzapur' 2018, languages
+ *   ['Hindi']). Accepted ONLY on near-exact title (score >=0.9) AND strict
+ *   year (both present, ±1 — no dub-year widening, no missing-year pass).
  */
 async function findHindiSubject(
   title: string,
@@ -201,23 +270,33 @@ async function findHindiSubject(
   for (const it of items) {
     const t = String(it.title ?? it.name ?? "");
     const langs: string[] = Array.isArray(it.languages) ? it.languages.map((l: any) => String(l)) : [];
-    const titleMarked = /\[hindi\]|\(hindi\)/i.test(t);
-    const langMarked = langs.some((l) => l.toLowerCase() === "hindi");
+    const titleMarked = hindiMarkedTitle(t);
+    const langMarked = hindiMarkedLangs(langs);
     if (!titleMarked && !langMarked) continue; // Hindi signal required
     const y = subjectYear(it);
-    // Year gate: Hindi-dub uploads often carry the dub-release year instead of
-    // the original year (GoT [Hindi]=2019 vs TMDB 2011; Breaking Bad [Hindi]=2013
-    // vs TMDB 2008). An explicit [Hindi] title marker is a deliberate dub label,
-    // so for TV it widens the gate to ±10; everything else keeps the ±1 filter.
-    const yearGate = type === "tv" && titleMarked ? 10 : 1;
-    if (y && year && Math.abs(y - year) > yearGate) continue;
     if (!kindMatches(it, type)) continue;
     const score = titleScore(title, t);
-    if (score > bestScore && score >= 0.5) {
-      const id = subjectIdOf(it);
-      if (id) {
-        bestScore = score;
-        best = { id, title: t };
+    if (titleMarked) {
+      // STRONG: explicit marker. TV keeps the ±10 dub-year gate.
+      const yearGate = type === "tv" ? 10 : 1;
+      if (y && year && Math.abs(y - year) > yearGate) continue;
+      const adj = y && year ? score : score * 0.7; // P1-8: missing year penalized, never silently skipped
+      if (adj > bestScore && adj >= 0.5) {
+        const id = subjectIdOf(it);
+        if (id) {
+          bestScore = adj;
+          best = { id, title: t };
+        }
+      }
+    } else {
+      // MEDIUM: languages-array Hindi only — near-exact title + strict year.
+      if (!y || !year || Math.abs(y - year) > 1) continue;
+      if (score > bestScore && score >= 0.9) {
+        const id = subjectIdOf(it);
+        if (id) {
+          bestScore = score;
+          best = { id, title: t };
+        }
       }
     }
   }
@@ -239,16 +318,20 @@ async function findDefaultSubject(
     const y = subjectYear(it);
     if (y && year && Math.abs(y - year) > 1) continue;
     if (!kindMatches(it, type)) continue;
-    const score = titleScore(title, t);
-    // Prefer non-Hindi-marked for the English lane, but accept Hindi-marked
-    // over nothing (a Bollywood original's default resource IS Hindi).
+    // P0-3 (2026-10-10): the English lane must NEVER serve a Hindi-marked
+    // stream — exclude, don't just deprioritize (the old ×0.9 penalty let
+    // Hindi-marked dubs win the English lane). Bollywood originals are
+    // unaffected: their default resource isn't [Hindi]-marked, and an
+    // explicit ?audio=en still falls through to VidLink (original track).
     const langs: string[] = Array.isArray(it.languages) ? it.languages.map((l: any) => String(l)) : [];
-    const hindiMarked = /\[hindi\]|\(hindi\)/i.test(t) || langs.some((l) => l.toLowerCase() === "hindi");
-    const adjusted = hindiMarked ? score * 0.9 : score;
-    if (adjusted > bestScore && score >= 0.5) {
+    if (hindiMarkedTitle(t) || hindiMarkedLangs(langs)) continue;
+    const score = titleScore(title, t);
+    // P1-8: a missing year no longer skips the gate silently — penalize.
+    const adj = y && year ? score : score * 0.7;
+    if (adj > bestScore && adj >= 0.5) {
       const id = subjectIdOf(it);
       if (id) {
-        bestScore = adjusted;
+        bestScore = adj;
         best = { id, title: t };
       }
     }
@@ -267,6 +350,27 @@ function extractQuality(url: string): string {
     return `${n}p`;
   }
   return "720p";
+}
+
+/**
+ * P2-14 (2026-10-10): build the CDN request headers for a MovieBox stream.
+ * Live wrapper probes prove the CDN requires the Edge-Cache-Cookie (403
+ * without it; Referer/Origin NOT required) and the wrapper itself always
+ * sends {Cookie, User-Agent: Mozilla/5.0}. If a response ever arrives
+ * without headers (the reported MP4 case — not reproducible against the
+ * live wrapper, which serves DASH only in ~18 probes), synthesize them
+ * from the cookie: the app must never get headers=[] for MovieBox.
+ * Exported for unit tests.
+ */
+export function buildMovieboxHeaders(
+  cookie: string | undefined,
+  wrapperHeaders: Record<string, string> | undefined
+): Record<string, string> {
+  return {
+    "User-Agent": "Mozilla/5.0", // the wrapper's own proven UA
+    ...(wrapperHeaders ?? {}),
+    ...(cookie ? { Cookie: cookie } : {}),
+  };
 }
 
 async function getStream(
@@ -307,20 +411,21 @@ async function getStream(
       size: parseInt(d.size ?? "0", 10) || 0,
     },
   ];
+  const cookie = typeof d.cookie === "string" ? d.cookie : undefined;
+  const wrapperHeaders =
+    d.headers && typeof d.headers === "object" && !Array.isArray(d.headers)
+      ? (d.headers as Record<string, string>)
+      : undefined;
   return {
     provider: "moviebox",
     qualities,
     subtitles: [],
     // Edge-Cache-Cookie -> the app sends it as a Cookie header on the
-    // manifest + every segment (without it the CDN 403s — live verified).
-    cookie: typeof d.cookie === "string" ? d.cookie : undefined,
-    // 2026-10-10 (428 fix): wrapper get_stream may also return extra request
-    // headers (e.g. Referer) required by the CDN for MP4 progressive URLs.
-    // Forward them so the app sends them (without them: 428).
-    headers:
-      d.headers && typeof d.headers === "object" && !Array.isArray(d.headers)
-        ? (d.headers as Record<string, string>)
-        : undefined,
+    // manifest + every segment (without it the CDN 403s — live verified
+    // 2026-10-10). buildMovieboxHeaders guarantees headers is never empty:
+    // cookie-derived Cookie + the wrapper's proven User-Agent.
+    cookie,
+    headers: buildMovieboxHeaders(cookie, wrapperHeaders),
   };
 }
 
@@ -338,10 +443,12 @@ async function resolveTitle(tmdbId: string, type: "movie" | "tv"): Promise<{ tit
  * wait AND the human pause both abort early on it (AbortError), so a
  * congested wrapper tier can never stretch a request past the deadline.
  */
-async function pacedCall<T>(work: () => Promise<T>, signal?: AbortSignal): Promise<T> {
-  const release = await acquirePace("mb_wrapper", signal);
+async function pacedCall<T>(work: () => Promise<T>, opts?: ProviderCallOpts): Promise<T> {
+  // P1-12: thread the pacer priority — background probes/prefetches queue
+  // behind real Play requests in the wrapper mutex.
+  const release = await acquirePace("mb_wrapper", opts?.signal, opts?.priority ?? "play");
   try {
-    await humanPause(signal); // 800–2500ms between sequential wrapper calls
+    await humanPause(opts?.signal); // 800–2500ms between sequential wrapper calls
     return await work();
   } finally {
     release();
@@ -379,7 +486,7 @@ export const movieboxHindi: ProviderFn = async (tmdbId, type, s, e, opts) => {
     if (await negGet(streamNegK)) return null;
     const r = await getStream(hit.id, type, season, episode, signal);
     return r ? { ...r, provider: "moviebox-hi" } : null;
-  }, opts?.signal);
+  }, opts);
 };
 
 /** L2 English lane's MovieBox tier — default resource, movies + TV series (Ali 2026-10-10). */
@@ -411,5 +518,5 @@ export const moviebox: ProviderFn = async (tmdbId, type, s, e, opts) => {
     const streamNegK = type === "tv" ? `stream:tv:${hit.id}:${season}:${episode}` : `stream:${hit.id}`;
     if (await negGet(streamNegK)) return null;
     return getStream(hit.id, type, season, episode, signal);
-  }, opts?.signal);
+  }, opts);
 };

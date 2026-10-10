@@ -23,6 +23,8 @@ export interface RaceOpts {
   signal?: AbortSignal;
   /** Per-provider miss/failure reason, for the aggregated error. */
   onError?: (provider: string, reason: string) => void;
+  /** P1-12: pacer priority, threaded to the provider call. */
+  priority?: "play" | "background";
 }
 
 export interface TierError {
@@ -66,6 +68,8 @@ export interface RaceConfig {
    * the deadline (Vercel hard-kills at 60s with no response at all).
    */
   parentSignal?: AbortSignal;
+  /** P1-12: pacer priority for the lane's provider calls. */
+  priority?: "play" | "background";
 }
 
 /** Runner for one provider inside a lane (chain.ts's tryProvider). */
@@ -224,6 +228,7 @@ export async function raceTier(
       const t0 = Date.now();
       tryOne(p, tmdbId, type, season, episode, () => !box.settled, {
         signal: ctrl.signal,
+        priority: cfg.priority, // P1-12: lane legs inherit the chain's pacer priority
         onError: (name, reason) => errors.push({ provider: name, reason }),
       } as RaceOpts).then((r) => {
         if (done) return;
