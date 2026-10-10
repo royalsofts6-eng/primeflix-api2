@@ -181,7 +181,30 @@ function kindMatches(it: any, type: "movie" | "tv"): boolean {
 }
 
 /**
- * D1 mapping: "{title} hindi" -> Hindi-marked subject, year ±1
+ * Hindi signals on a wrapper subject (live shapes 2026-10-10).
+ * - Explicit title marker: "Title [Hindi]" / "Title (Hindi)" — the
+ *   reliable signal (the languages array is noise: "Breaking Bad [Hindi]"
+ *   lists ["English","Spanish"], "Premalu [Hindi]" lists
+ *   ["Malayalam","Telugu"]).
+ * - Languages array: entries may be "Hindi", "hi", "Hindi; English", etc.
+ */
+function hindiMarkedTitle(t: string): boolean {
+  return /\[hindi\]|\(hindi\)/i.test(t);
+}
+
+function hindiMarkedLangs(langs: string[]): boolean {
+  return langs.some((l) =>
+    String(l)
+      .toLowerCase()
+      .split(/[;,/]/)
+      .some((p) => {
+        const w = p.trim();
+        return w === "hindi" || w === "hi";
+      })
+  );
+}
+
+/** D1 mapping: "{title} hindi" -> Hindi-marked subject, year ±1
  * (±10 for TV with an explicit [Hindi] title marker — dub uploads often
  * carry the dub-release year, e.g. GoT [Hindi]=2019 vs TMDB 2011),
  * kind movie/series per requested type, ≥50% token overlap (D4 junk
@@ -201,8 +224,8 @@ async function findHindiSubject(
   for (const it of items) {
     const t = String(it.title ?? it.name ?? "");
     const langs: string[] = Array.isArray(it.languages) ? it.languages.map((l: any) => String(l)) : [];
-    const titleMarked = /\[hindi\]|\(hindi\)/i.test(t);
-    const langMarked = langs.some((l) => l.toLowerCase() === "hindi");
+    const titleMarked = hindiMarkedTitle(t);
+    const langMarked = hindiMarkedLangs(langs);
     if (!titleMarked && !langMarked) continue; // Hindi signal required
     const y = subjectYear(it);
     // Year gate: Hindi-dub uploads often carry the dub-release year instead of
@@ -239,16 +262,18 @@ async function findDefaultSubject(
     const y = subjectYear(it);
     if (y && year && Math.abs(y - year) > 1) continue;
     if (!kindMatches(it, type)) continue;
-    const score = titleScore(title, t);
-    // Prefer non-Hindi-marked for the English lane, but accept Hindi-marked
-    // over nothing (a Bollywood original's default resource IS Hindi).
+    // P0-3 (2026-10-10): the English lane must NEVER serve a Hindi-marked
+    // stream — exclude, don't just deprioritize (the old ×0.9 penalty let
+    // Hindi-marked dubs win the English lane). Bollywood originals are
+    // unaffected: their default resource isn't [Hindi]-marked, and an
+    // explicit ?audio=en still falls through to VidLink (original track).
     const langs: string[] = Array.isArray(it.languages) ? it.languages.map((l: any) => String(l)) : [];
-    const hindiMarked = /\[hindi\]|\(hindi\)/i.test(t) || langs.some((l) => l.toLowerCase() === "hindi");
-    const adjusted = hindiMarked ? score * 0.9 : score;
-    if (adjusted > bestScore && score >= 0.5) {
+    if (hindiMarkedTitle(t) || hindiMarkedLangs(langs)) continue;
+    const score = titleScore(title, t);
+    if (score > bestScore && score >= 0.5) {
       const id = subjectIdOf(it);
       if (id) {
-        bestScore = adjusted;
+        bestScore = score;
         best = { id, title: t };
       }
     }
