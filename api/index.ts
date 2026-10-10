@@ -22,7 +22,7 @@ import { NotAvailableError } from "../src/providers/types.js";
 import { raceStats } from "../src/race.js";
 import { warmFZMovies, fzStats } from "../src/providers/fzmovies.js";
 import { cacheStats, ck, CACHE_SCHEMA } from "../src/cache.js";
-import { streamCacheStats, streamCacheKey } from "../src/streamcache.js";
+import { streamCacheStats, streamCacheKey, cachedEnvelopeProvider } from "../src/streamcache.js";
 import type { StreamCacheStat } from "../src/streamcache.js";
 import { warmTrendingStreams, warmFZMoviesBatch, noteWatch } from "../src/warm.js";
 import { redisCommand } from "../src/security/redis.js";
@@ -485,9 +485,15 @@ export default async function handler(req: any, res: any) {
         typeof b.provider === "string" && /^[a-z0-9-]{1,32}$/i.test(b.provider)
           ? b.provider.toLowerCase()
           : null;
+      // P1-13 (2026-10-10): the app sends provider:"" for prefetched streams
+      // (its lastProvider is empty on the prefetch path) — derive the
+      // provider from the cached envelope so dead prefetch URLs still feed
+      // the canary instead of vanishing.
+      const effectiveProvider =
+        providerName ?? (await cachedEnvelopeProvider({ type, tmdbId: id, season, episode, audio }));
       let deadCount = 0;
-      if (providerName) {
-        deadCount = await recordDeadReport(providerName);
+      if (effectiveProvider) {
+        deadCount = await recordDeadReport(effectiveProvider);
       }
       const guard = await redisCommand(["SET", guardKey, "1", "NX", "EX", 3600]).catch(() => null);
       if (guard !== "OK") {
@@ -501,7 +507,7 @@ export default async function handler(req: any, res: any) {
         "LPUSH",
         deadlogKey,
         JSON.stringify({
-          provider: providerName,
+          provider: effectiveProvider,
           type,
           tmdbId: id,
           season: season ?? 0,
@@ -529,8 +535,8 @@ export default async function handler(req: any, res: any) {
       const HINDI_LANE = new Set(["vidzee", "fzmovies", "moviebox-hi"]);
       const hindiGone =
         b.reason === "hindi_no_longer_available" ||
-        (providerName !== null &&
-          HINDI_LANE.has(providerName) &&
+        (effectiveProvider !== null &&
+          HINDI_LANE.has(effectiveProvider) &&
           (audio === undefined || audio === "hi"));
       // Phase D (2026-10-09, design §4a): a 403/404 is signature death
       // (not a network blip) — the lang envelope for this title must be

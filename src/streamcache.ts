@@ -260,6 +260,24 @@ async function writeEnvelope(key: string, rkey: string, result: ChainResult): Pr
   await negClear(key);
 }
 
+/**
+ * P1-13 (2026-10-10): winning provider of the cached envelope for a title,
+ * or null when there is none. Lets /v1/stream/report attribute dead-URL
+ * reports that carry no provider (the app sends provider:"" for prefetched
+ * streams) so dead prefetch URLs still feed the canary instead of
+ * vanishing. Never throws (fail-open -> null).
+ */
+export async function cachedEnvelopeProvider(args: StreamArgs): Promise<string | null> {
+  try {
+    const key = streamCacheKey(args.type, args.tmdbId, args.season, args.episode, args.audio);
+    const env = await readEnvelope(key, redisKeyFor(key));
+    const p = env?.result?.provider;
+    return typeof p === "string" && /^[a-z0-9-]{1,32}$/.test(p) ? p : null;
+  } catch {
+    return null;
+  }
+}
+
 /** True when a FRESH (non-stale) entry exists — used by the pre-warm cron. */
 export async function isStreamCachedFresh(
   type: "movie" | "tv",
