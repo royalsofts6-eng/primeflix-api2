@@ -1,23 +1,27 @@
 /**
- * 4-source parallel chain with LANGUAGE LANES + circuit breaker + health.
+ * 4-source chain with LANGUAGE LANES + circuit breaker + health.
  *
- * Architecture (Ali 2026-10-09 — 4-source parallel system):
+ * Architecture (Ali 2026-10-10 — MovieBox FIRST):
  *   L0 stream cache (streamcache.ts, unchanged)
+ *   miss -> MovieBox FIRST (5s timeout): most accurate TMDB catalog —
+ *           wrong-movie/wrong-series reports stop here
  *   miss -> L1 HINDI LANE (8s): vidzee + fzmovies — PARALLEL, first wins
- *   miss -> MovieBox-hi SEQUENTIAL tier (cyber rule: wrapper leg NEVER in a
- *           race — paced 1 req/5s, max 1 concurrent, kill-switched)
+ *   miss -> L1b ENGLISH-ORIGINAL check (Bollywood Hindi originals)
  *   miss -> L2 ENGLISH LANE (8s): vidlink
- *   miss -> MovieBox-en SEQUENTIAL tier
  *   miss -> honest error (never cached)
  *
- * Why lanes, not one flat race: a flat race lets VidLink English (~1-2s)
- * beat VidZee Hindi (~3s) on titles that HAVE Hindi — Hindi-first breaks.
- * Lanes = language protection; INSIDE a lane every source is equal and
- * parallel (no backup hierarchy).
+ * Why MovieBox first, not a flat race: MovieBox's catalog has the most
+ * accurate TMDB title mapping — racing lets a faster-but-wrong provider
+ * win on titles where MovieBox would have matched correctly. MovieBox
+ * gets a short 5s window (pacer-friendly); on miss/timeout/block the
+ * lanes race as before. Language protection preserved: Hindi lane before
+ * English lane; ?audio=hi never falls back to English silently.
  *
- * ?audio=hi -> L1 only (+ Bollywood-original VidLink check, then honest
- *   "hindi dubbed not available" — no silent English fallback).
- * ?audio=en -> L2 only. Omitted -> Hindi-first: L1 -> MB-hi -> L2 -> MB-en.
+ * ?audio=hi -> MB-hi (5s) -> L1 -> (Bollywood-original VidLink) ->
+ *   honest "hindi dubbed not available" (no silent English fallback).
+ * ?audio=en -> MB-en (5s) -> L2 -> aggregated error.
+ * omitted   -> Hindi-first: MB-hi (5s) -> L1 -> MB-en (5s) -> L2 ->
+ *   aggregated error.
  *
  * Circuit breaker: 5 consecutive fails -> 5 min cooldown (in-memory fast
  * path + Redis cross-instance mirror). 429s are RateLimitedError — Redis
@@ -580,6 +584,40 @@ async function wrapperTier(
 }
 
 /**
+ * MovieBox FIRST-source window (Ali 2026-10-10): MovieBox has the most
+ * accurate TMDB catalog mapping, so it gets the first shot at every
+ * resolution. Short timeout — on miss/timeout/block/congestion the caller
+ * falls through to the lanes. Never throws; null = "try the next step".
+ *
+ * The 5s cap covers pacer wait + human pause + fetch. A congested pacer
+ * (token wait) aborts here instead of delaying the lanes — the user gets
+ * the fastest AVAILABLE source, with MovieBox preferred when responsive.
+ */
+export const MOVIEBOX_FIRST_TIMEOUT_MS = Math.max(
+  1000,
+  parseInt(process.env.MOVIEBOX_FIRST_TIMEOUT_MS || "5000", 10) || 5000
+);
+
+async function movieboxFirst(
+  name: "moviebox-hi" | "moviebox",
+  fn: ProviderFn,
+  tmdbId: string,
+  type: "movie" | "tv",
+  season?: number,
+  episode?: number,
+  /** The chain's 45s deadline signal — combined with the 5s first-window. */
+  parentSignal?: AbortSignal
+): Promise<ProviderResult | null> {
+  const firstWindow = AbortSignal.timeout(MOVIEBOX_FIRST_TIMEOUT_MS);
+  const signal = parentSignal
+    ? AbortSignal.any([parentSignal, firstWindow])
+    : firstWindow;
+  // wrapperTier treats abort as a silent miss (never a failure, never a
+  // circuit trip) — exactly the "fall through" semantics we want.
+  return wrapperTier(name, fn, tmdbId, type, season, episode, signal);
+}
+
+/**
  * Resolve a stream through the language lanes.
  *
  * ?audio=hi -> L1 Hindi race -> MovieBox-hi tier -> (Bollywood-original
@@ -680,18 +718,20 @@ export async function resolveStreamLive(
       : new Error(msg);
   };
 
-  // Explicit Hindi request: L1 only.
-  // Explicit English request: L2 only.
-  // Omitted: Hindi-first across all four sources.
+  // Explicit Hindi request: MovieBox-hi FIRST (5s), then L1.
+  // Explicit English request: MovieBox-en FIRST (5s), then L2.
+  // Omitted: Hindi-first: MB-hi (5s) -> L1 -> MB-en (5s) -> L2.
   // P0-1: the whole dispatch runs under the 45s deadline timer (cleared in
   // the finally below, whichever lane path wins or throws).
   try {
     if (audio === "hi") {
+      // Ali 2026-10-10: MovieBox first — most accurate catalog kills the
+      // wrong-movie problem. 5s window, then the Hindi lane races.
+      const mbFirst = await movieboxFirst("moviebox-hi", movieboxHindi, tmdbId, type, season, episode, dsignal);
+      if (mbFirst) return win(mbFirst);
+      throwIfDeadline();
       const h1 = await runLane(HINDI_LANE, HINDI_LANE_BUDGET_MS, dsignal);
       if (h1) return win(h1);
-      throwIfDeadline();
-      const mb = await wrapperTier("moviebox-hi", movieboxHindi, tmdbId, type, season, episode, dsignal);
-      if (mb) return win(mb);
       throwIfDeadline();
       // Bollywood/Hindi-original titles: VidLink serves the Hindi ORIGINAL, so
       // ?audio=hi is satisfiable even with no dubbed copy (Ali 2026-10-08:
@@ -705,39 +745,40 @@ export async function resolveStreamLive(
     }
 
     if (audio === "en") {
+      // Ali 2026-10-10: MovieBox-en first (5s), then the English lane.
+      const mbFirst = await movieboxFirst("moviebox", moviebox, tmdbId, type, season, episode, dsignal);
+      if (mbFirst) return win(mbFirst);
+      throwIfDeadline();
       const e1 = await runLane(ENGLISH_LANE, ENGLISH_LANE_BUDGET_MS, dsignal);
       if (e1) return win(e1);
-      throwIfDeadline();
-      const mb = await wrapperTier("moviebox", moviebox, tmdbId, type, season, episode, dsignal);
-      if (mb) return win(mb);
       throwIfDeadline();
       throw terminalError();
     }
 
-    // Default: Hindi-first across all four sources.
+    // Default: Hindi-first — MB-hi (5s) -> L1 -> MB-en (5s) -> L2.
+    const mbHiFirst = await movieboxFirst("moviebox-hi", movieboxHindi, tmdbId, type, season, episode, dsignal);
+    if (mbHiFirst) return win(mbHiFirst);
+    throwIfDeadline();
     const d1 = await runLane(HINDI_LANE, HINDI_LANE_BUDGET_MS, dsignal);
     if (d1) return win(d1);
-    throwIfDeadline();
-    const dmb = await wrapperTier("moviebox-hi", movieboxHindi, tmdbId, type, season, episode, dsignal);
-    if (dmb) return win(dmb);
     throwIfDeadline();
     // Win #5 (2026-10-09, Ali approved): the Hindi wrapper leg writes a 24h
     // catalog-gap negative key (pf:mbneg:hi:{tmdbId}) when the wrapper
     // catalog lacks the title. The English leg searches the SAME wrapper
-    // catalog, so a gap there predicts a gap here — skip the second paced
-    // wrapper call (~2–10s saved) and go straight to L2 / honest error.
-    // Transient failures set no neg key, so the en tier still runs when the
-    // hi leg failed for network/server reasons. TV titles never set the hi
-    // neg key (wrapper is movies-only), so TV behavior is unchanged.
+    // catalog, so a gap there predicts a gap here — skip the second wrapper
+    // call and go straight to L2. Transient failures set no neg key, so the
+    // en attempt still runs when the hi leg failed for network/server
+    // reasons. TV titles never set the hi neg key (wrapper is movies-only),
+    // so TV behavior is unchanged.
     const mbEnCatalogGap = await movieboxHindiKnownMissing(tmdbId);
+    if (!mbEnCatalogGap) {
+      const mbEnFirst = await movieboxFirst("moviebox", moviebox, tmdbId, type, season, episode, dsignal);
+      if (mbEnFirst) return win(mbEnFirst);
+      throwIfDeadline();
+    }
     const d2 = await runLane(ENGLISH_LANE, ENGLISH_LANE_BUDGET_MS, dsignal);
     if (d2) return win(d2);
     throwIfDeadline();
-    if (!mbEnCatalogGap) {
-      const dmb2 = await wrapperTier("moviebox", moviebox, tmdbId, type, season, episode, dsignal);
-      if (dmb2) return win(dmb2);
-      throwIfDeadline();
-    }
     throw terminalError();
   } finally {
     clearTimeout(deadlineTimer);
