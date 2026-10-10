@@ -204,13 +204,20 @@ function hindiMarkedLangs(langs: string[]): boolean {
   );
 }
 
-/** D1 mapping: "{title} hindi" -> Hindi-marked subject, year ±1
- * (±10 for TV with an explicit [Hindi] title marker — dub uploads often
- * carry the dub-release year, e.g. GoT [Hindi]=2019 vs TMDB 2011),
- * kind movie/series per requested type, ≥50% token overlap (D4 junk
- * filter — drops mislabeled uploads like "Cheetah on Fire").
- * Hindi signal: [Hindi]/(Hindi) title marker OR "hindi" in the wrapper's
- * languages array (series often lack title markers).
+/**
+ * D1 mapping: "{title} hindi" -> Hindi subject.
+ *
+ * Hindi signal (P0-4, 2026-10-10 — live-verified: the languages array is
+ * noise; "Breaking Bad [Hindi]" lists ["English","Spanish"], "Premalu
+ * [Hindi]" lists ["Malayalam","Telugu"]):
+ * - STRONG: explicit [Hindi]/(Hindi) title marker. Year gate ±1 (movies)
+ *   or ±10 (TV — dub uploads carry the dub-release year, e.g. GoT
+ *   [Hindi]=2019 vs TMDB 2011; P0-3: do not regress). P1-8: a missing
+ *   year no longer skips the gate silently — score x0.7 penalty.
+ * - MEDIUM ("equivalent strong signal"): languages-array Hindi WITHOUT a
+ *   title marker (Hindi originals like 'Mirzapur' 2018, languages
+ *   ['Hindi']). Accepted ONLY on near-exact title (score >=0.9) AND strict
+ *   year (both present, ±1 — no dub-year widening, no missing-year pass).
  */
 async function findHindiSubject(
   title: string,
@@ -228,19 +235,29 @@ async function findHindiSubject(
     const langMarked = hindiMarkedLangs(langs);
     if (!titleMarked && !langMarked) continue; // Hindi signal required
     const y = subjectYear(it);
-    // Year gate: Hindi-dub uploads often carry the dub-release year instead of
-    // the original year (GoT [Hindi]=2019 vs TMDB 2011; Breaking Bad [Hindi]=2013
-    // vs TMDB 2008). An explicit [Hindi] title marker is a deliberate dub label,
-    // so for TV it widens the gate to ±10; everything else keeps the ±1 filter.
-    const yearGate = type === "tv" && titleMarked ? 10 : 1;
-    if (y && year && Math.abs(y - year) > yearGate) continue;
     if (!kindMatches(it, type)) continue;
     const score = titleScore(title, t);
-    if (score > bestScore && score >= 0.5) {
-      const id = subjectIdOf(it);
-      if (id) {
-        bestScore = score;
-        best = { id, title: t };
+    if (titleMarked) {
+      // STRONG: explicit marker. TV keeps the ±10 dub-year gate.
+      const yearGate = type === "tv" ? 10 : 1;
+      if (y && year && Math.abs(y - year) > yearGate) continue;
+      const adj = y && year ? score : score * 0.7; // P1-8: missing year penalized, never silently skipped
+      if (adj > bestScore && adj >= 0.5) {
+        const id = subjectIdOf(it);
+        if (id) {
+          bestScore = adj;
+          best = { id, title: t };
+        }
+      }
+    } else {
+      // MEDIUM: languages-array Hindi only — near-exact title + strict year.
+      if (!y || !year || Math.abs(y - year) > 1) continue;
+      if (score > bestScore && score >= 0.9) {
+        const id = subjectIdOf(it);
+        if (id) {
+          bestScore = score;
+          best = { id, title: t };
+        }
       }
     }
   }
@@ -270,10 +287,12 @@ async function findDefaultSubject(
     const langs: string[] = Array.isArray(it.languages) ? it.languages.map((l: any) => String(l)) : [];
     if (hindiMarkedTitle(t) || hindiMarkedLangs(langs)) continue;
     const score = titleScore(title, t);
-    if (score > bestScore && score >= 0.5) {
+    // P1-8: a missing year no longer skips the gate silently — penalize.
+    const adj = y && year ? score : score * 0.7;
+    if (adj > bestScore && adj >= 0.5) {
       const id = subjectIdOf(it);
       if (id) {
-        bestScore = score;
+        bestScore = adj;
         best = { id, title: t };
       }
     }
