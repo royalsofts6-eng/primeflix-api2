@@ -108,9 +108,23 @@ export async function movieboxHindiVerdict(tmdbId: string, type: "movie" | "tv" 
   }
 }
 
+// ── Matcher generation (P0-2 follow-up, 2026-10-10) ─────────────────────────
+// The hi/en SUBJECT neg keys are tied to the MATCHER logic. When the matcher
+// changes (P0-3/P0-4/P1-7/P1-8), stale neg entries from the old logic must
+// not block the new one for 24h — live-proven: hi:tv:1396/1399 written by
+// the pre-±10 year gate still blocked GoT/Breaking Bad Hindi AFTER the fix
+// deployed. Bump MB_MATCHER_GEN on any matcher change; old keys
+// orphan-expire (24h TTL). Stream-level neg keys (stream:*) are about
+// get_stream 404s, not matching — unversioned.
+const MB_MATCHER_GEN = "m2";
+const hiNegK = (tmdbId: string, type: "movie" | "tv"): string =>
+  type === "tv" ? `hi:${MB_MATCHER_GEN}:tv:${tmdbId}` : `hi:${MB_MATCHER_GEN}:${tmdbId}`;
+const enNegK = (tmdbId: string, type: "movie" | "tv"): string =>
+  type === "tv" ? `en:${MB_MATCHER_GEN}:tv:${tmdbId}` : `en:${MB_MATCHER_GEN}:${tmdbId}`;
+
 /** True when a chain run already proved MovieBox has NO Hindi for this title. */
 export async function movieboxHindiKnownMissing(tmdbId: string, type: "movie" | "tv" = "movie"): Promise<boolean> {
-  return negGet(type === "tv" ? `hi:tv:${tmdbId}` : `hi:${tmdbId}`);
+  return negGet(hiNegK(tmdbId, type));
 }
 
 async function negGet(k: string): Promise<boolean> {
@@ -462,7 +476,7 @@ export const movieboxHindi: ProviderFn = async (tmdbId, type, s, e, opts) => {
   const season = s ?? 1;
   const episode = e ?? 1;
   // TV neg keys are namespaced so a same-numbered movie/TV pair can't collide.
-  const negK = type === "tv" ? `hi:tv:${tmdbId}` : `hi:${tmdbId}`;
+  const negK = hiNegK(tmdbId, type);
   if (await negGet(negK)) return null;
   const signal = composeSignal(opts?.signal);
   return pacedCall(async () => {
@@ -495,7 +509,7 @@ export const moviebox: ProviderFn = async (tmdbId, type, s, e, opts) => {
   if (!(await wrapperAlive())) return null;
   const season = s ?? 1;
   const episode = e ?? 1;
-  const negK = type === "tv" ? `en:tv:${tmdbId}` : `en:${tmdbId}`;
+  const negK = enNegK(tmdbId, type);
   if (await negGet(negK)) return null;
   const signal = composeSignal(opts?.signal);
   return pacedCall(async () => {
