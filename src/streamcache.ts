@@ -456,6 +456,17 @@ export async function resolveStreamCached(
   stats.misses++;
   try {
     const r = await resolveLiveSingleflight(key, rkey, live);
+    // P0-2 (2026-10-10): file the envelope under the ACTUALLY-served audio
+    // key too — a default-chain Hindi win IS a valid ?audio=hi answer (same
+    // legs: MB-hi/L1) and a default-chain English win IS a valid ?audio=en
+    // answer (same legs: MB-en/L2), so explicit-audio requests hit the
+    // cache instead of re-running the chain. Non-hi/en codes (e.g. VidLink
+    // serving the "ko" original) have no request-side key — skip.
+    const servedAudioKey = r.audio === "hi" || r.audio === "en" ? r.audio : undefined;
+    if (servedAudioKey && servedAudioKey !== (args.audio || "def")) {
+      const skey = streamCacheKey(args.type, args.tmdbId, args.season, args.episode, servedAudioKey);
+      await writeEnvelope(skey, redisKeyFor(skey), r).catch(() => {});
+    }
     if (stat) {
       stat.status = "MISS";
       stat.provider = r?.provider;

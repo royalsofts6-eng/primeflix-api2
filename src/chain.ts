@@ -31,7 +31,7 @@ import { vidlink } from "./providers/vidlink.js";
 import { VidLinkKeyDeadError } from "./providers/vidlink.js";
 import { vidzee } from "./providers/vidzee.js";
 import { fzmovies } from "./providers/fzmovies.js";
-import { moviebox, movieboxHindi, movieboxHindiKnownMissing, movieboxHindiVerdict, movieboxLive, noteMovieboxHindi, wrapperStatus } from "./providers/moviebox.js";
+import { moviebox, movieboxHindi, movieboxHindiKnownMissing, movieboxHindiVerdict, movieboxLive, noteMovieboxHindi, wrapperStatus, mbhilangKey } from "./providers/moviebox.js";
 import { tmdb } from "./tmdb.js";
 import type { ProviderFn, ProviderResult } from "./providers/types.js";
 import { NotAvailableError } from "./providers/types.js";
@@ -41,7 +41,7 @@ import {
   type FailureClass,
 } from "./providers/failures.js";
 import { redisEnabled, redisCacheGet, redisCacheSet, redisCommand } from "./security/redis.js";
-import { cacheGet, cacheSet, ck } from "./cache.js";
+import { cacheGet, cacheSet, cacheDel, ck } from "./cache.js";
 import { cachedStreamProviders, resolveStreamCached, isStreamCachedFresh, isNegativelyCached } from "./streamcache.js";
 import type { StreamCacheStat } from "./streamcache.js";
 import {
@@ -385,7 +385,8 @@ const CONTENT_MISS_RE = /no qualities|content-miss|null body|not-available|not a
 const TRANSIENT_RE =
   /429|rate.?limit|pacer|timed? ?out|timeout|network|econn|socket|refused|dns|key-death|forbidden|not_found|abort|upstream|5\d\d/i;
 
-function allContentMiss(errors: TierError[]): boolean {
+/** Exported for unit tests (p0p1p2-fixes). */
+export function allContentMiss(errors: TierError[]): boolean {
   return (
     errors.length > 0 &&
     errors.every(
@@ -559,8 +560,99 @@ export async function tryProvider(
 export interface ChainResult extends ProviderResult {
   resolvedBy: string;
   latencyMs: number;
+  /**
+   * P0-1 (2026-10-10): the ACTUAL audio served, as an ISO 639-1 code
+   * ("hi"/"en"/"ko"/...). The default (audio-omitted) chain tries Hindi
+   * first and may fall back to English — this field reports reality so the
+   * app/UI never shows a language that isn't playing. For VidLink wins it
+   * is the TMDB original_language (VidLink serves the original track).
+   */
+  audio: string;
   /** Runner-up results for client-side failover (envelope v3). */
   alternates: RankedAlternate[];
+}
+
+/** Providers whose win guarantees Hindi audio. */
+const HINDI_PROVIDERS = new Set(["moviebox-hi", "vidzee", "fzmovies"]);
+
+// ── Served-audio record (P0-2, 2026-10-10) ─────────────────────────────────
+// Chain truth for /languages alignment: pf:v3:served:{type}:{id}:{s}:{e}:{req}
+// = the ISO audio code the chain ACTUALLY served, 30-min TTL. {req} is the
+// REQUEST audio ("def"/"hi"/"en") — an explicit ?audio=en win must NOT poison
+// the default-chain verdict /languages reads ("def"). A fallback English win
+// on the default chain must never leave a stale "Hindi available" verdict
+// standing: availableAudio() treats a fresh "def"->"en" record as authoritative
+// (probes are skipped), and a genuine Hindi content-miss on the default chain
+// evicts the lang envelope + MovieBox-Hindi verdict outright (re-probe, don't lie).
+const SERVED_TTL_S = 30 * 60;
+const servedKey = (
+  type: "movie" | "tv",
+  tmdbId: string,
+  season?: number,
+  episode?: number,
+  reqAudio?: string
+): string => ck("served", type, tmdbId, season ?? 0, episode ?? 0, reqAudio || "def");
+
+/** Record the audio the chain actually served. Never throws. */
+async function recordServedAudio(
+  type: "movie" | "tv",
+  tmdbId: string,
+  season: number | undefined,
+  episode: number | undefined,
+  reqAudio: string | undefined,
+  audio: string
+): Promise<void> {
+  if (!redisEnabled()) return;
+  try {
+    await redisCacheSet(servedKey(type, tmdbId, season, episode, reqAudio), audio, SERVED_TTL_S);
+  } catch {
+    /* best-effort */
+  }
+}
+
+/**
+ * Fresh served-audio record for the DEFAULT chain ("hi"/"en"/..., or null
+ * when none/expired). Never throws (fail-open -> null).
+ */
+export async function readServedAudio(
+  type: "movie" | "tv",
+  tmdbId: string,
+  season?: number,
+  episode?: number
+): Promise<string | null> {
+  if (!redisEnabled()) return null;
+  try {
+    const v = await redisCacheGet<string>(servedKey(type, tmdbId, season, episode));
+    return typeof v === "string" && v.length >= 2 ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * P0-2: evict the /languages verdict for a title after the chain proved the
+ * Hindi absence genuine — the next /languages re-probes instead of serving
+ * the stale "Hindi available" envelope for 12h. Never throws.
+ */
+export async function evictLangVerdict(
+  type: "movie" | "tv",
+  tmdbId: string,
+  season?: number,
+  episode?: number
+): Promise<void> {
+  try {
+    const langK = ck("lang", type, tmdbId, season ?? 0, episode ?? 0);
+    cacheDel(langK);
+    if (redisEnabled()) {
+      await redisCommand(["DEL", langK]).catch(() => null);
+      // MovieBox-Hindi verdict: drop it too — the chain just proved Hindi
+      // is gone (P0-5 will namespace this key per season; the call is
+      // updated there).
+      await redisCommand(["DEL", mbhilangKey(tmdbId, type)]).catch(() => null);
+    }
+  } catch {
+    /* best-effort */
+  }
 }
 
 /**
@@ -576,11 +668,18 @@ async function wrapperTier(
   season?: number,
   episode?: number,
   /** P0-1: the chain's 45s deadline — aborts a congested wrapper tier. */
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  /** P0-2/P1-11: miss reasons out-param — lets the chain distinguish a
+   *  genuine catalog gap ("miss: no qualities") from a transient
+   *  ("pacer timeout", network, 5xx). */
+  errors?: TierError[]
 ): Promise<ProviderResult | null> {
   if (signal?.aborted) return null;
   if (await providerBlocked(name)) return null;
-  return tryProvider({ name, fn }, tmdbId, type, season, episode, () => true, { signal });
+  return tryProvider({ name, fn }, tmdbId, type, season, episode, () => true, {
+    signal,
+    onError: (pname, reason) => errors?.push({ provider: pname, reason }),
+  });
 }
 
 /**
@@ -612,7 +711,9 @@ async function movieboxFirst(
   /** Head-start window. Movies: 8s (lanes follow on miss). TV: 15s — no
    *  fallback exists, so the paced wrapper leg gets room (still under the
    *  45s chain deadline). */
-  timeoutMs: number = MOVIEBOX_FIRST_TIMEOUT_MS
+  timeoutMs: number = MOVIEBOX_FIRST_TIMEOUT_MS,
+  /** P0-2/P1-11: miss reasons out-param (see wrapperTier). */
+  errors?: TierError[]
 ): Promise<ProviderResult | null> {
   const firstWindow = AbortSignal.timeout(timeoutMs);
   const signal = parentSignal
@@ -620,7 +721,7 @@ async function movieboxFirst(
     : firstWindow;
   // wrapperTier treats abort as a silent miss (never a failure, never a
   // circuit trip) — exactly the "fall through" semantics we want.
-  return wrapperTier(name, fn, tmdbId, type, season, episode, signal);
+  return wrapperTier(name, fn, tmdbId, type, season, episode, signal, errors);
 }
 
 /**
@@ -690,7 +791,28 @@ export async function resolveStreamLive(
     return tr.result;
   };
 
-  const win = (r: ProviderResult): ChainResult => {
+  const win = async (
+    r: ProviderResult,
+    opts?: { hindiGenuineMiss?: boolean }
+  ): Promise<ChainResult> => {
+    // P0-1 (2026-10-10): the ACTUAL served audio — the default chain tries
+    // Hindi first and may fall back to English, so report reality, never the
+    // request. VidLink serves the original track -> TMDB original_language.
+    let servedAudio: string;
+    if (HINDI_PROVIDERS.has(r.provider)) servedAudio = "hi";
+    else if (r.provider === "vidlink") servedAudio = await originalLanguage(tmdbId, type);
+    else servedAudio = "en";
+    // P0-2: record chain truth for /languages alignment (never throws).
+    // The record is namespaced by REQUEST audio — an explicit ?audio=en win
+    // must not poison the default-chain ("def") verdict /languages reads.
+    void recordServedAudio(type, tmdbId, season, episode, audio, servedAudio);
+    // P0-2: genuine Hindi content-miss + English served on the default
+    // chain -> the /languages Hindi verdict is stale — evict it so the next
+    // /languages re-probes instead of lying for 12h. Transient misses never
+    // evict (hindiGenuineMiss is only true for all-content-miss lanes).
+    if (servedAudio === "en" && opts?.hindiGenuineMiss) {
+      void evictLangVerdict(type, tmdbId, season, episode);
+    }
     // P1 (2026-10-09): MovieBox-Hindi language verdict — a moviebox-hi win
     // (or alternate) proves Hindi exists for this title, so /languages can
     // later answer from chain state instead of live-probing the wrapper.
@@ -703,6 +825,7 @@ export async function resolveStreamLive(
     }
     return {
       ...r,
+      audio: servedAudio,
       resolvedBy: r.provider,
       latencyMs: Date.now() - t0,
       alternates: rankAlternates(alternates),
@@ -739,7 +862,8 @@ export async function resolveStreamLive(
     if (type === "tv") {
       const MB_TV_TIMEOUT_MS = 15000;
       if (audio === "hi") {
-        const mb = await movieboxFirst("moviebox-hi", movieboxHindi, tmdbId, type, season, episode, dsignal, MB_TV_TIMEOUT_MS);
+        const mbErrs: TierError[] = [];
+        const mb = await movieboxFirst("moviebox-hi", movieboxHindi, tmdbId, type, season, episode, dsignal, MB_TV_TIMEOUT_MS, mbErrs);
         if (mb) return win(mb);
         throwIfDeadline();
         throw new ChainContentMissError("hindi dubbed not available");
@@ -751,11 +875,15 @@ export async function resolveStreamLive(
         throw terminalError();
       }
       // Default: Hindi-first, MovieBox only.
-      const mbHi = await movieboxFirst("moviebox-hi", movieboxHindi, tmdbId, type, season, episode, dsignal, MB_TV_TIMEOUT_MS);
+      const mbHiErrs: TierError[] = [];
+      const mbHi = await movieboxFirst("moviebox-hi", movieboxHindi, tmdbId, type, season, episode, dsignal, MB_TV_TIMEOUT_MS, mbHiErrs);
       if (mbHi) return win(mbHi);
       throwIfDeadline();
+      // P0-2: genuine Hindi content-miss (not transient)? Only a genuine
+      // miss invalidates the /languages Hindi verdict on an English win.
+      const hindiGenuineMiss = allContentMiss(mbHiErrs);
       const mbEn = await movieboxFirst("moviebox", moviebox, tmdbId, type, season, episode, dsignal, MB_TV_TIMEOUT_MS);
-      if (mbEn) return win(mbEn);
+      if (mbEn) return win(mbEn, { hindiGenuineMiss });
       throwIfDeadline();
       throw terminalError();
     }
@@ -790,12 +918,17 @@ export async function resolveStreamLive(
       throw terminalError();
     }
 
-    // Default: Hindi-first — MB-hi (5s) -> L1 -> MB-en (5s) -> L2.
-    const mbHiFirst = await movieboxFirst("moviebox-hi", movieboxHindi, tmdbId, type, season, episode, dsignal);
+    // Default: Hindi-first — MB-hi (8s) -> L1 -> MB-en (8s) -> L2.
+    const mbHiErrs: TierError[] = [];
+    const mbHiFirst = await movieboxFirst("moviebox-hi", movieboxHindi, tmdbId, type, season, episode, dsignal, MOVIEBOX_FIRST_TIMEOUT_MS, mbHiErrs);
     if (mbHiFirst) return win(mbHiFirst);
     throwIfDeadline();
+    const hindiErrMark = laneErrors.length;
     const d1 = await runLane(HINDI_LANE, HINDI_LANE_BUDGET_MS, dsignal);
     if (d1) return win(d1);
+    // P0-2: genuine Hindi content-miss (not transient)? Only a genuine miss
+    // invalidates the /languages Hindi verdict when English wins below.
+    const hindiGenuineMiss = allContentMiss([...mbHiErrs, ...laneErrors.slice(hindiErrMark)]);
     throwIfDeadline();
     // Win #5 (2026-10-09, Ali approved): the Hindi wrapper leg writes a 24h
     // catalog-gap negative key (pf:mbneg:hi:{tmdbId}, TV: pf:mbneg:hi:tv:{tmdbId})
@@ -811,7 +944,7 @@ export async function resolveStreamLive(
       throwIfDeadline();
     }
     const d2 = await runLane(ENGLISH_LANE, ENGLISH_LANE_BUDGET_MS, dsignal);
-    if (d2) return win(d2);
+    if (d2) return win(d2, { hindiGenuineMiss });
     throwIfDeadline();
     throw terminalError();
   } finally {
@@ -1013,7 +1146,22 @@ export async function availableAudio(
   // Hindi-dub check only matters when the original is not already Hindi.
   let hindiDub = original === "hi";
   if (!hindiDub) {
-    if (type === "tv") {
+    // P0-2 (2026-10-10): the chain's served-audio record is authoritative
+    // while fresh — it reflects what Play ACTUALLY served on the default
+    // chain, not what probes hope. "hi" -> Hindi proven (skip probes);
+    // "en" -> the chain fell back to English (skip probes, don't lie).
+    const served = await readServedAudio(type, tmdbId, season, episode);
+    if (served === "hi") {
+      hindiDub = true;
+    } else if (served === "en") {
+      hindiDub = false;
+    } else if (
+      await isNegativelyCached({ type, tmdbId, season, episode, audio: "hi" })
+    ) {
+      // P0-2: the explicit-Hindi chain recently proved a genuine content
+      // miss (30-min neg cache) — don't re-probe, don't claim Hindi.
+      hindiDub = false;
+    } else if (type === "tv") {
       // Ali 2026-10-10: series stream MovieBox-only — the dub button must
       // reflect MovieBox Hindi availability, never VidZee/FZMovies.
       hindiDub = await movieboxHindiAvailable(tmdbId, "tv", season, episode);
