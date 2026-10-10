@@ -589,13 +589,15 @@ async function wrapperTier(
  * resolution. Short timeout — on miss/timeout/block/congestion the caller
  * falls through to the lanes. Never throws; null = "try the next step".
  *
- * The 5s cap covers pacer wait + human pause + fetch. A congested pacer
- * (token wait) aborts here instead of delaying the lanes — the user gets
- * the fastest AVAILABLE source, with MovieBox preferred when responsive.
+ * The 8s cap covers pacer wait + human pause + fetch (P1 2026-10-10: the
+ * 5s window aborted the 3.5–5.5s MovieBox leg mid-flight under pacer
+ * contention). A congested pacer (token wait) aborts here instead of
+ * delaying the lanes — the user gets the fastest AVAILABLE source, with
+ * MovieBox preferred when responsive.
  */
 export const MOVIEBOX_FIRST_TIMEOUT_MS = Math.max(
   1000,
-  parseInt(process.env.MOVIEBOX_FIRST_TIMEOUT_MS || "5000", 10) || 5000
+  parseInt(process.env.MOVIEBOX_FIRST_TIMEOUT_MS || "8000", 10) || 8000
 );
 
 async function movieboxFirst(
@@ -607,7 +609,7 @@ async function movieboxFirst(
   episode?: number,
   /** The chain's 45s deadline signal — combined with the first-window. */
   parentSignal?: AbortSignal,
-  /** Head-start window. Movies: 5s (lanes follow on miss). TV: 15s — no
+  /** Head-start window. Movies: 8s (lanes follow on miss). TV: 15s — no
    *  fallback exists, so the paced wrapper leg gets room (still under the
    *  45s chain deadline). */
   timeoutMs: number = MOVIEBOX_FIRST_TIMEOUT_MS
