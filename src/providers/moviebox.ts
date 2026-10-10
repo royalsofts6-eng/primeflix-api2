@@ -181,9 +181,11 @@ function kindMatches(it: any, type: "movie" | "tv"): boolean {
 }
 
 /**
- * D1 mapping: "{title} hindi" -> [Hindi]-marked subject, year ±1,
+ * D1 mapping: "{title} hindi" -> Hindi-marked subject, year ±1,
  * kind movie/series per requested type, ≥50% token overlap (D4 junk
  * filter — drops mislabeled uploads like "Cheetah on Fire").
+ * Hindi signal: [Hindi]/(Hindi) title marker OR "hindi" in the wrapper's
+ * languages array (series often lack title markers).
  */
 async function findHindiSubject(
   title: string,
@@ -196,7 +198,9 @@ async function findHindiSubject(
   let bestScore = 0;
   for (const it of items) {
     const t = String(it.title ?? it.name ?? "");
-    if (!/\[hindi\]|\(hindi\)/i.test(t)) continue; // Hindi marker required
+    const langs: string[] = Array.isArray(it.languages) ? it.languages.map((l: any) => String(l)) : [];
+    const hindiMarked = /\[hindi\]|\(hindi\)/i.test(t) || langs.some((l) => l.toLowerCase() === "hindi");
+    if (!hindiMarked) continue; // Hindi signal required
     const y = subjectYear(it);
     if (y && year && Math.abs(y - year) > 1) continue; // year ±1
     if (!kindMatches(it, type)) continue;
@@ -230,7 +234,9 @@ async function findDefaultSubject(
     const score = titleScore(title, t);
     // Prefer non-Hindi-marked for the English lane, but accept Hindi-marked
     // over nothing (a Bollywood original's default resource IS Hindi).
-    const adjusted = /\[hindi\]|\(hindi\)/i.test(t) ? score * 0.9 : score;
+    const langs: string[] = Array.isArray(it.languages) ? it.languages.map((l: any) => String(l)) : [];
+    const hindiMarked = /\[hindi\]|\(hindi\)/i.test(t) || langs.some((l) => l.toLowerCase() === "hindi");
+    const adjusted = hindiMarked ? score * 0.9 : score;
     if (adjusted > bestScore && score >= 0.5) {
       const id = subjectIdOf(it);
       if (id) {
