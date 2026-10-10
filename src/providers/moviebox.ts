@@ -167,15 +167,29 @@ async function wrapperSearch(query: string, signal: AbortSignal): Promise<any[]>
 }
 
 /**
+ * Wrapper kind discriminator. The wrapper returns type:"movie"|"series"
+ * (older shapes used subjectType 1/2). Unknown shapes keep the historical
+ * movies-only leniency: movies accept anything that isn't explicitly a
+ * series; TV requires an explicit series marker.
+ */
+function kindMatches(it: any, type: "movie" | "tv"): boolean {
+  const t = String(it.type ?? "").toLowerCase();
+  if (t === "series") return type === "tv";
+  if (t === "movie") return type === "movie";
+  const st = String(it.subjectType ?? it.subject_type ?? "1");
+  return type === "tv" ? st === "2" : st === "1";
+}
+
+/**
  * D1 mapping: "{title} hindi" -> [Hindi]-marked subject, year ±1,
- * subjectType 1 (movie) / 2 (series), ≥50% token overlap (D4 junk filter —
- * drops mislabeled uploads like "Cheetah on Fire").
+ * kind movie/series per requested type, ≥50% token overlap (D4 junk
+ * filter — drops mislabeled uploads like "Cheetah on Fire").
  */
 async function findHindiSubject(
   title: string,
   year: number,
   signal: AbortSignal,
-  wantSubjectType: "1" | "2"
+  type: "movie" | "tv"
 ): Promise<SearchHit | null> {
   const items = await wrapperSearch(`${title} hindi`, signal);
   let best: SearchHit | null = null;
@@ -185,7 +199,7 @@ async function findHindiSubject(
     if (!/\[hindi\]|\(hindi\)/i.test(t)) continue; // Hindi marker required
     const y = subjectYear(it);
     if (y && year && Math.abs(y - year) > 1) continue; // year ±1
-    if (String(it.subjectType ?? it.subject_type ?? "1") !== wantSubjectType) continue;
+    if (!kindMatches(it, type)) continue;
     const score = titleScore(title, t);
     if (score > bestScore && score >= 0.5) {
       const id = subjectIdOf(it);
@@ -203,7 +217,7 @@ async function findDefaultSubject(
   title: string,
   year: number,
   signal: AbortSignal,
-  wantSubjectType: "1" | "2"
+  type: "movie" | "tv"
 ): Promise<SearchHit | null> {
   const items = await wrapperSearch(title, signal);
   let best: SearchHit | null = null;
@@ -212,7 +226,7 @@ async function findDefaultSubject(
     const t = String(it.title ?? it.name ?? "");
     const y = subjectYear(it);
     if (y && year && Math.abs(y - year) > 1) continue;
-    if (String(it.subjectType ?? it.subject_type ?? "1") !== wantSubjectType) continue;
+    if (!kindMatches(it, type)) continue;
     const score = titleScore(title, t);
     // Prefer non-Hindi-marked for the English lane, but accept Hindi-marked
     // over nothing (a Bollywood original's default resource IS Hindi).
@@ -328,7 +342,7 @@ export const movieboxHindi: ProviderFn = async (tmdbId, type, s, e, opts) => {
     if (!title) return null;
     let hit: SearchHit | null = null;
     try {
-      hit = await findHindiSubject(title, year, signal, type === "tv" ? "2" : "1");
+      hit = await findHindiSubject(title, year, signal, type);
     } catch (e) {
       if (e instanceof ProviderFailure && e.status === 404) {
         await negSet(negK);
@@ -361,7 +375,7 @@ export const moviebox: ProviderFn = async (tmdbId, type, s, e, opts) => {
     if (!title) return null;
     let hit: SearchHit | null = null;
     try {
-      hit = await findDefaultSubject(title, year, signal, type === "tv" ? "2" : "1");
+      hit = await findDefaultSubject(title, year, signal, type);
     } catch (e) {
       if (e instanceof ProviderFailure && e.status === 404) {
         await negSet(negK);
